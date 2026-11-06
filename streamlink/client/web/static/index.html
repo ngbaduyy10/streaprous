@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>StreamLink</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="login-view" class="login-view">
+    <form id="login-form" class="login-card" autocomplete="on">
+      <div class="brand-large"><span class="logo">SL</span> StreamLink</div>
+      <p class="muted">Chat and share files on a local network over a custom reliable UDP protocol.</p>
+      <div class="row">
+        <label class="grow">Server
+          <input id="login-host" required placeholder="127.0.0.1">
+        </label>
+        <label class="port">TCP port
+          <input id="login-port" type="number" min="1" max="65535" required>
+        </label>
+      </div>
+      <label>Username
+        <input id="login-user" required autocomplete="username" pattern="[A-Za-z0-9_.\-]{1,32}"
+               title="1-32 characters: letters, digits, _ . -">
+      </label>
+      <label>Password
+        <input id="login-pass" type="password" required autocomplete="current-password">
+      </label>
+      <button type="submit" id="login-btn">Log in</button>
+      <p id="login-error" class="error" role="alert"></p>
+      <p class="hint">A new account is created on the first login.</p>
+    </form>
+  </div>
+
+  <div id="app-view" class="app hidden">
+    <header class="topbar">
+      <div class="brand"><span class="logo">SL</span> StreamLink</div>
+      <div class="conn">
+        <span id="conn-badge" class="badge">-</span>
+        <span id="conn-detail" class="muted"></span>
+      </div>
+      <div class="me">
+        <span id="me-name"></span>
+        <button id="logout-btn" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <aside class="sidebar">
+      <section>
+        <h2>Conversations</h2>
+        <ul id="conversations" class="list"></ul>
+      </section>
+      <section>
+        <h2>Online <span id="online-count" class="count">0</span></h2>
+        <ul id="users" class="list"></ul>
+      </section>
+    </aside>
+
+    <main class="chat" id="chat">
+      <div class="chat-header">
+        <h2 id="chat-title"># Everyone</h2>
+        <span id="chat-sub" class="muted"></span>
+      </div>
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <div id="drop-hint" class="drop-hint hidden">Drop a file to send</div>
+      <form id="composer" class="composer">
+        <label class="file-btn" title="Send a file (direct messages only)">
+          <input type="file" id="file-input" hidden>
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0v-10z"/></svg>
+        </label>
+        <input id="message-input" placeholder="Type a message..." maxlength="4000" autocomplete="off">
+        <button type="submit">Send</button>
+      </form>
+    </main>
+
+    <aside class="panel">
+      <section>
+        <h2>Network</h2>
+        <dl id="net-stats" class="stats"></dl>
+      </section>
+      <section class="grow">
+        <h2>Transfers</h2>
+        <ul id="transfers" class="transfers"></ul>
+        <p id="no-transfers" class="muted small">No files yet. Open a direct conversation, then use the paperclip or drop a file into the chat.</p>
+      </section>
+    </aside>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
