@@ -16,6 +16,7 @@ uploads/
 # StreapRous TCP work: generated traces, charts, logs, large test files
 out/
 *.log
+streaprous/apps/demo_*.bin
 
 # editors
 .vscode/
