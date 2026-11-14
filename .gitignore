@@ -12,3 +12,11 @@ data/users.json
 downloads/
 uploads/
 *.part
+
+# StreapRous TCP work: generated traces, charts, logs, large test files
+out/
+*.log
+
+# editors
+.vscode/
+.idea/

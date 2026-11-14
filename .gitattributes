@@ -1,0 +1,4 @@
+# Files that run inside Linux (Docker, the course VMs) need LF even on a Windows checkout.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.Dockerfile text eol=lf
