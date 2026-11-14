@@ -25,6 +25,14 @@ class TcpReceiver:
     """
 
     def __init__(self, rcv_nxt, buffer_size, delayed_ack, on_event=None):
+        """Sets up the receiver.
+
+        Args:
+            rcv_nxt: First sequence number expected from the peer.
+            buffer_size: RcvBuffer in bytes (slide 3-94).
+            delayed_ack: Delayed-ACK time in seconds (slide 3-85, row 1).
+            on_event: Callback ``on_event(name, **details)`` for trace events.
+        """
         self.rcv_nxt = rcv_nxt
         self.buffer_size = buffer_size
         self.delayed_ack = delayed_ack

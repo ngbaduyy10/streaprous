@@ -17,6 +17,14 @@ class LossInjector:
     """
 
     def __init__(self, drop_send=frozenset(), drop_recv=frozenset(), rate=0.0, seed=None):
+        """Sets up the drop rules.
+
+        Args:
+             drop_send  numbers n of the first transmissions to drop
+             drop_recv  numbers n of the received data segments to drop
+             rate       probability of dropping each sent data segment
+             seed       seed of the random generator
+        """
         self.drop_send = frozenset(drop_send)
         self.drop_recv = frozenset(drop_recv)
         self.rate = rate

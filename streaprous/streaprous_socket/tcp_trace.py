@@ -65,6 +65,15 @@ class TcpTrace:
     """
 
     def __init__(self, name, log_level, csv_path=None, clock=time.monotonic, write=print):
+        """Sets up the trace.
+
+        Args:
+             name       connection name for log lines, such as the client address
+             log_level  0 only DROP, 1 key events, 2 every segment
+             csv_path   file to write, or None for no file
+             clock      function returning seconds
+             write      function that prints one line
+        """
         self.name = name
         self.log_level = log_level
         self.csv_path = csv_path
