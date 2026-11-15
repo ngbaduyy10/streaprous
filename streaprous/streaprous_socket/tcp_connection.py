@@ -46,10 +46,11 @@ class TcpConnection:
          peer_window   window of the client's SYN, or None when unknown
          settings      settings object from tcp_config.load_settings
          clock         function returning seconds
+         syn_seq       sequence number of the client's SYN, or None when unknown
     """
 
     def __init__(self, sock, conn_info, packet_queue, peer_mss, peer_window, settings,
-                 clock=time.monotonic):
+                 clock=time.monotonic, syn_seq=None):
         """Builds the sender, receiver and helpers; the worker starts in start().
 
         Args:
@@ -60,6 +61,7 @@ class TcpConnection:
              peer_window   window of the client's SYN, or None when unknown
              settings      settings object from tcp_config.load_settings
              clock=time.monotonic  function returning seconds
+             syn_seq=None  sequence number of the client's SYN, or None when unknown
         """
         self.sock = sock
         self.conn_info = conn_info
@@ -76,7 +78,12 @@ class TcpConnection:
         self.peer_mss = peer_mss
         self.mss = min(settings.mss_limit, peer_mss)
         self.iss = conn_info.server_seq
-        self.irs = conn_info.client_seq
+        # The first data byte is SYN seq + 1. The handshake's third packet can be a
+        # reordered data segment, so its seq is used only when the SYN was not seen.
+        if syn_seq is not None:
+            self.irs = wrap(syn_seq + 1)
+        else:
+            self.irs = conn_info.client_seq
         rwnd = peer_window if peer_window is not None else self.mss
 
         self.cond = threading.Condition()
@@ -424,7 +431,7 @@ _registry_lock = threading.Lock()
 
 
 def note_client_syn(client_key, tcp_bytes):
-    """Remembers the MSS option and window of a client's SYN.
+    """Remembers the MSS option, window and sequence number of a client's SYN.
 
     Args:
          client_key  (client_ip, client_port)
@@ -432,9 +439,10 @@ def note_client_syn(client_key, tcp_bytes):
     """
     if len(tcp_bytes) < 20:
         return
+    seq = struct.unpack('!L', tcp_bytes[4:8])[0]
     window = struct.unpack('!H', tcp_bytes[14:16])[0]
     with _registry_lock:
-        _syn_info[client_key] = (parse_mss_option(tcp_bytes), window)
+        _syn_info[client_key] = (parse_mss_option(tcp_bytes), window, seq)
 
 
 def get_connection(sock, conn_info):
@@ -451,10 +459,10 @@ def get_connection(sock, conn_info):
     with _registry_lock:
         conn = _connections.get(key)
         if conn is None:
-            mss_option, window = _syn_info.pop(key, (None, None))
+            mss_option, window, syn_seq = _syn_info.pop(key, (None, None, None))
             peer_mss = mss_option if mss_option is not None else SETTINGS.default_peer_mss
             conn = TcpConnection(sock, conn_info, get_packet_queue(key), peer_mss, window,
-                                 SETTINGS)
+                                 SETTINGS, syn_seq=syn_seq)
             _connections[key] = conn
             conn.start()
         return conn

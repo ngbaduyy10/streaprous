@@ -262,7 +262,8 @@ class AcceptHookTests(unittest.TestCase):
         session = result[0]
         self.assertEqual(session.state, 'ESTABLISHED')
         self.assertEqual(session.server_seq, 2001)
-        self.assertEqual(tcp_connection._syn_info[KEY], (1460, 64240))
+        syn_seq = struct.unpack('!L', syn[4:8])[0]
+        self.assertEqual(tcp_connection._syn_info[KEY], (1460, 64240, syn_seq))
         syn_ack = parse_tcp_packet(sock.packets[0][0])
         self.assertEqual(syn_ack.flags, SYN | ACK)
         self.assertEqual(syn_ack.window, RECV_BUFFER)

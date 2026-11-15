@@ -657,6 +657,28 @@ class RegistryTests(ConnectionTestCase):
         self.assertEqual(conn.sender.rwnd, 64240)
         self.assertNotIn(KEY, tcp_connection._syn_info)
 
+    def test_first_byte_follows_syn(self):
+        """
+        The receiver expects SYN seq + 1 even when the third handshake packet was data.
+
+        With reordering, a later data segment can reach accept before the bare
+        ACK, and accept then keeps that segment's seq (the SYN
+        carries the client's initial sequence number).
+        """
+        syn = fixture_tcp('syn')
+        syn_seq = struct.unpack('!L', syn[4:8])[0]
+        tcp_connection.note_client_syn(KEY, syn)
+        self.info = make_info(client_seq=wrap(syn_seq + 1 + 1072))
+        conn = self.open_and_close()
+        self.assertEqual(conn.irs, wrap(syn_seq + 1))
+        self.assertEqual(conn.receiver.rcv_nxt, wrap(syn_seq + 1))
+
+    def test_first_byte_without_syn(self):
+        """With no SYN noted, the receiver starts at accept's client_seq."""
+        tcp_connection._syn_info.pop(KEY, None)
+        conn = self.open_and_close()
+        self.assertEqual(conn.receiver.rcv_nxt, CLIENT_SEQ)
+
     def test_mss_without_syn_option(self):
         """Without an MSS option the connection uses 536 bytes."""
         syn = fixture_tcp('syn')
