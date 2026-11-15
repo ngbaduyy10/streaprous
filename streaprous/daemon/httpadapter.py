@@ -164,42 +164,93 @@ class HttpAdapter:
 
         print("[HttpAdapter] Invoke handle_client_raw for {}:{}".format(conn_info.client_ip, conn_info.client_port))
 
-        # Receive data using streaprous raw connection
-        data = run_conn_recv(raw_socket, conn_info)
-        
-        if not data:
-            print("[HttpAdapter] No data received or connection closed")
-            return
+        # TEAM: read the whole request from the byte stream, always close once
+        try:
+            data = self.read_request_raw(raw_socket, conn_info)
 
-        # Prepare request
-        msg = data.decode("utf-8")
-        req.prepare(msg, routes)
-        
-        # Handle request hook
-        if req.hook:
-            #
-            # TODO: handle for App hook here
-            #
-            response = ""
-        else:
-            # Build response - returns bytes
-            response = resp.build_response(req)
-        
-        # Send response using streaprous raw connection
-        response = response if isinstance(response, bytes) else response.encode("utf-8")
-        print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
-        #
-        # TODO run_conn_send packet
-        # run_conn_send(..)
-        
-        # Wait longer to ensure response is transmitted, client processes it, and sends ACK
-        import time
-        time.sleep(5.0)
-        
+            if not data:
+                print("[HttpAdapter] No data received or connection closed")
+                return
+
+            try:
+                # Prepare request
+                msg = data.decode("utf-8", errors="replace")
+                req.prepare(msg, routes)
+
+                # Handle request hook
+                if req.hook:
+                    #
+                    # TODO: handle for App hook here
+                    #
+                    response = ""
+                else:
+                    # Build response - returns bytes
+                    response = resp.build_response(req)
+                response = response if isinstance(response, bytes) else response.encode("utf-8")
+            except Exception as e:
+                print("[HttpAdapter] Error handling request: {}".format(e))
+                response = (b"HTTP/1.1 400 Bad Request\r\n"
+                            b"Content-Length: 0\r\n"
+                            b"Connection: close\r\n\r\n")
+
+            print(f"[HttpAdapter] HTTP Response ({len(response)} bytes): {response[:200]}")
+            # Send the response reliably; blocks until every byte is ACKed
+            run_conn_send(raw_socket, conn_info, response)
+        finally:
+            close_connection(raw_socket, conn_info)
+
         # Close connection with FIN packet
         #
         # TODO run_conn_send packet
         # close_connection(...)
+
+    def read_request_raw(self, raw_socket, conn_info):
+        """
+        Read one whole HTTP request from the TCP byte stream.
+
+        TCP delivers bytes without message borders (handout section 2.1), so the
+        end of a request is found here: first the blank line that ends the
+        headers, then Content-Length body bytes.
+
+        :param raw_socket (socket): The raw socket for communication.
+        :param conn_info (conn_struct): The connection info for the client.
+        :rtype: bytes - the request, or b"" if the connection closed before any byte.
+        """
+        # TEAM: new method, reassemble a request split over many segments
+        import hashlib
+        from streaprous_socket.tcp_config import SETTINGS
+
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = run_conn_recv(raw_socket, conn_info, timeout=SETTINGS.request_timeout)
+            if not chunk:
+                return data
+            data += chunk
+
+        head, _, body = data.partition(b"\r\n\r\n")
+
+        length = 0
+        for line in head.decode("utf-8", errors="replace").split("\r\n")[1:]:
+            key, sep, val = line.partition(":")
+            if sep and key.strip().lower() == "content-length":
+                try:
+                    length = max(0, int(val.strip()))
+                except ValueError:
+                    length = 0
+
+        while len(body) < length:
+            if SETTINGS.app_read_delay > 0:
+                time.sleep(SETTINGS.app_read_delay)
+            chunk = run_conn_recv(raw_socket, conn_info,
+                                  max_bytes=SETTINGS.app_read_bytes or None,
+                                  timeout=SETTINGS.request_timeout)
+            if not chunk:
+                break
+            body += chunk
+
+        print("[HttpAdapter] Read request: header {} bytes, body {} bytes, sha256 {}".format(
+            len(head), len(body), hashlib.sha256(body).hexdigest()))
+        return head + b"\r\n\r\n" + body
 
     async def handle_client_coroutine(self, reader, writer):
         """

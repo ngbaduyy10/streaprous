@@ -112,17 +112,10 @@ class Request():
         self.method, self.path, self.version = self.extract_request_line(request)
         print("[Request] {} path {} version {}".format(self.method, self.path, self.version))
 
-        #
-        # TODO:  Parse headers and body 
-        # with self.fetch_headers_body(request)
-        # and self.prepare_headers(self._raw_headers)
-        #
-
-        # self._raw_headers = ... 
-        # self._raw_body =...
-        # self.headers = ...
-        
-        self.prepare_headers(self._raw_headers)
+        # TEAM: fill the Lab 3 gap, split the message and parse the headers
+        self._raw_headers, self._raw_body = self.fetch_headers_body(request)
+        self.body = self._raw_body
+        self.headers = self.prepare_headers(self._raw_headers)
         print("[Request] Parsed headers: {}".format(self.headers))
 
         #
