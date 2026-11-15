@@ -410,7 +410,9 @@ class TcpSender:
         (slide 3-124). ``snd_nxt`` goes back to ``snd_una`` (BSD Reno,
         background), so the rest of the window is resent as ACKs open it and
         several losses in one window cost one timeout. After more than
-        ``max_retries`` timeouts in a row we give up.
+        ``max_retries`` timeouts in a row we give up. The resent segment is
+        a full one when data allows, so it may reach past ``snd_max``; then
+        ``snd_max`` moves with it, so an ACK for all of it is accepted.
 
         Args:
             now: Current time in seconds.
@@ -438,6 +440,7 @@ class TcpSender:
         seq = self.snd_una
         segment = self._emit(seq, payload, fin, 'timeout', True)
         self.snd_nxt = seq + (1 if fin else len(payload))
+        self.snd_max = max(self.snd_max, self.snd_nxt)  # may be longer than the first copy
         self._start_timer(now)
         self.on_event('TIMEOUT', seq=seq, len=len(payload), rto=self.rtt.rto)
         return [segment]
@@ -502,7 +505,9 @@ class TcpSender:
         Resend the segment at ``snd_una`` without waiting for the timer (slide 3-88).
 
         Three duplicate ACKs mean later segments arrived, so only this one
-        is probably lost. ``snd_nxt`` and the timer stay as they are.
+        is probably lost. ``snd_nxt`` and the timer stay as they are;
+        ``snd_max`` moves when the resent segment is longer than the first
+        copy, so an ACK for all of it is accepted.
 
         Args:
             now: Current time in seconds.
@@ -515,6 +520,7 @@ class TcpSender:
         self.fast_retransmits += 1
         self._cancel_rtt_timing()
         segment = self._emit(seq, payload, fin, 'fast', True)
+        self.snd_max = max(self.snd_max, seq + (1 if fin else len(payload)))
         self.on_event('FAST_RETRANSMIT', seq=seq, len=len(payload))
         return [segment]
 

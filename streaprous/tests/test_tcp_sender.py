@@ -308,6 +308,17 @@ class TimeoutTest(unittest.TestCase):
         tx.on_tick(tx.next_deadline())
         self.assertFalse(tx.gave_up)
 
+    def test_timeout_resend_longer_than_first_copy(self):
+        """A full resend past snd_max moves snd_max, so its ACK is accepted."""
+        tx, _ = make(rwnd=50)
+        data = data_of(400)
+        self.assertEqual([len(s.payload) for s in tx.write(data, 0.0)], [50])
+        out = tx.on_tick(1.0)
+        self.assertEqual(out, [SendSegment(ISS, data[:100], False, 'timeout')])
+        self.assertEqual((tx.snd_nxt, tx.snd_max), (ISS + 100, ISS + 100))
+        tx.on_ack(ISS + 100, 50, False, 1.1)
+        self.assertEqual(tx.snd_una, ISS + 100)
+
 
 class RttSampleTest(unittest.TestCase):
     """SampleRTT from first transmissions only (slide 3-81)."""
@@ -426,6 +437,20 @@ class FastRetransmitTest(unittest.TestCase):
         self.assertEqual([(s.seq, s.kind) for s in out], [(ISS + 500, 'new')])
         self.assertEqual(tx.cc.cwnd, 600)
         self.assertEqual(tx.bytes_in_flight(), 600)
+
+    def test_fast_resend_longer_than_first_copy(self):
+        """A fast retransmit past snd_max moves snd_max, so its ACK is accepted."""
+        tx, _ = make(rwnd=50, cwnd=4 * MSS)
+        data = data_of(400)
+        tx.write(data, 0.0)
+        tx.on_ack(ISS, 50, False, 0.1)
+        tx.on_ack(ISS, 50, False, 0.1)
+        out = tx.on_ack(ISS, 50, False, 0.1)
+        self.assertEqual(out, [SendSegment(ISS, data[:100], False, 'fast')])
+        self.assertEqual((tx.snd_nxt, tx.snd_max), (ISS + 50, ISS + 100))
+        out = tx.on_ack(ISS + 100, 50, False, 0.2)
+        self.assertEqual(tx.snd_una, ISS + 100)
+        self.assertEqual([(s.seq, len(s.payload), s.kind) for s in out], [(ISS + 100, 50, 'new')])
 
 
 class WindowLimitTest(unittest.TestCase):
