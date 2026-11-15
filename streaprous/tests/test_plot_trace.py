@@ -89,6 +89,22 @@ class TestPlotTrace(unittest.TestCase):
         ET.parse(out)
         self.assertIn('TIMEOUT=1', buffer.getvalue())
 
+    def test_main_non_ascii_path_on_narrow_console(self):
+        """main still works when stdout cannot encode the folder name."""
+        import io
+        import contextlib
+        folder = os.path.join(self.tmp.name, 'M' + chr(0x1ea1) + 'ng')
+        os.makedirs(folder)
+        out = os.path.join(folder, 'cwnd.svg')
+        raw = io.BytesIO()
+        narrow = io.TextIOWrapper(raw, encoding='cp1252')
+        with contextlib.redirect_stdout(narrow):
+            code = plot_trace.main([self.csv, '-o', out])
+            narrow.flush()
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(out))
+        self.assertIn(b'M\\u1ea1ng', raw.getvalue())
+
     def test_empty_trace(self):
         """A trace without rows still gives a valid SVG."""
         ET.fromstring(plot_trace.render_svg([], False))

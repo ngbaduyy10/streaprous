@@ -193,6 +193,22 @@ def render_svg(rows, window_mode=False, title='TCP trace'):
     return '\n'.join(out) + '\n'
 
 
+def print_line(text):
+    """Print one line, escaping characters the console cannot show.
+
+    On Windows a piped stdout often uses a code page without letters such as
+    the ones in our folder names, and a plain print() would stop the tool.
+
+    Args:
+        text: the line to print.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        print(text.encode(encoding, 'backslashreplace').decode(encoding))
+
+
 def main(argv=None):
     """Command line entry point.
 
@@ -213,8 +229,8 @@ def main(argv=None):
     svg = render_svg(rows, args.window, os.path.basename(args.trace))
     with open(out_path, 'w') as handle:
         handle.write(svg)
-    print(out_path)
-    print('events: ' + ' '.join('%s=%d' % pair for pair in count_events(rows)))
+    print_line(out_path)
+    print_line('events: ' + ' '.join('%s=%d' % pair for pair in count_events(rows)))
     return 0
 
 
