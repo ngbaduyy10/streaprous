@@ -4,9 +4,9 @@ Simulated transfers for the TCP sender and receiver.
 One TcpSender talks to one TcpReceiver over two one-way links in virtual
 time: the data link carries segments from the sender to the receiver, the
 ACK link carries ACKs back. Each link has a fixed delay and can drop,
-duplicate and reorder packets. A small reader model plays the application
-that reads from the receiver. Nothing here touches sockets, threads or
-the wall clock, so every run is deterministic.
+delay, duplicate and reorder packets. A small reader model plays the
+application that reads from the receiver. Nothing here touches sockets,
+threads or the wall clock, so every run is deterministic.
 """
 
 import heapq
@@ -14,8 +14,9 @@ import random
 from collections import namedtuple
 
 from streaprous_socket.tcp_receiver import TcpReceiver
-from streaprous_socket.tcp_reno import RenoCongestion
-from streaprous_socket.tcp_rtt import RttEstimator
+from streaprous_socket.tcp_reno import INITIAL_SSTHRESH, RenoCongestion
+from streaprous_socket.tcp_rtt import (FIRST_TIMEOUT_INTERVAL, MIN_TIMEOUT_INTERVAL,
+                                       RttEstimator)
 from streaprous_socket.tcp_sender import TcpSender
 
 # One packet on a link. Data packets fill seq, payload, fin and kind (the
@@ -23,16 +24,16 @@ from streaprous_socket.tcp_sender import TcpSender
 Packet = namedtuple('Packet', ['seq', 'payload', 'fin', 'kind', 'ack', 'window', 'reason'])
 
 # One recorded event: virtual time, name, details and the numbers of the
-# side that raised it at that moment.
+# side that raised it, taken just after the event.
 Event = namedtuple('Event', ['time', 'name', 'details', 'state'])
 
 # What run_transfer gives back.
-Result = namedtuple('Result', ['delivered', 'sender_events', 'receiver_events', 'time',
-                               'sender', 'receiver', 'data_link', 'ack_link'])
+Result = namedtuple('Result', ['delivered', 'sent', 'sender_events', 'receiver_events',
+                               'time', 'sender', 'receiver', 'data_link', 'ack_link'])
 
 
 class SimulationFailed(AssertionError):
-    """A transfer did not finish: time limit, give-up or nothing left to do."""
+    """A transfer did not finish: time limit, or nothing left to happen."""
 
 
 class VirtualClock:
@@ -65,20 +66,23 @@ class VirtualClock:
 
 class Link:
     """
-    One-way link with a fixed delay, losses, copies and reordering.
+    One-way link with a fixed delay, losses, extra delays, copies and reordering.
 
     Deterministic drops count data segments (non-empty payload) from 1:
     ``drop_new`` holds indexes among first transmissions (kind 'new'),
     ``drop_any`` indexes among every data segment. ``drop_if`` is a
     callable ``drop_if(packet, now)`` for any other rule, such as one
-    chosen ACK or the FIN. Random loss, copies and reordering use one
-    seeded generator, so a run repeats exactly.
+    chosen ACK or the FIN. ``delay_if`` is a callable ``delay_if(packet,
+    now)`` that returns extra delay in seconds for chosen packets (0 or
+    None for none). Random loss, copies and reordering use one seeded
+    generator, so a run repeats exactly.
 
     Args:
         delay: One-way delay in seconds.
         drop_new: Indexes of first transmissions to drop.
         drop_any: Indexes of data segments (any kind) to drop.
         drop_if: Callable that returns True for a packet to drop, or None.
+        delay_if: Callable that returns extra delay for a packet, or None.
         loss: Probability of dropping any packet.
         duplicate: Probability of delivering a packet twice.
         reorder: Probability of holding a packet back by ``reorder_delay``.
@@ -86,8 +90,8 @@ class Link:
         seed: Seed of the random generator.
     """
 
-    def __init__(self, delay, drop_new=(), drop_any=(), drop_if=None, loss=0.0,
-                 duplicate=0.0, reorder=0.0, reorder_delay=None, seed=1):
+    def __init__(self, delay, drop_new=(), drop_any=(), drop_if=None, delay_if=None,
+                 loss=0.0, duplicate=0.0, reorder=0.0, reorder_delay=None, seed=1):
         """
         Make an empty link.
 
@@ -96,6 +100,7 @@ class Link:
             drop_new: Indexes of first transmissions to drop.
             drop_any: Indexes of data segments (any kind) to drop.
             drop_if: Callable ``drop_if(packet, now)`` or None.
+            delay_if: Callable ``delay_if(packet, now)`` or None.
             loss: Probability of dropping any packet.
             duplicate: Probability of delivering a packet twice.
             reorder: Probability of holding a packet back.
@@ -106,6 +111,7 @@ class Link:
         self.drop_new = frozenset(drop_new)
         self.drop_any = frozenset(drop_any)
         self.drop_if = drop_if
+        self.delay_if = delay_if
         self.loss = loss
         self.duplicate = duplicate
         self.reorder = reorder
@@ -117,21 +123,21 @@ class Link:
         self.data_count = 0
         self.sent = 0
         self.dropped = []
+        self.delayed = []
         self.copies = 0
         self.held_back = 0
 
-    def send(self, packet, now):
+    def drop_reason(self, packet, now):
         """
-        Put one packet on the link, or drop it.
+        Decide whether a packet is lost, counting data segments on the way.
 
         Args:
             packet: The Packet.
             now: Current virtual time.
 
         Returns:
-            bool: True when the packet will arrive, False when it was dropped.
+            str or None: Why it is dropped, or None when it goes through.
         """
-        self.sent += 1
         why = None
         if packet.payload:
             self.data_count += 1
@@ -145,20 +151,39 @@ class Link:
             why = 'rule'
         if why is None and self.loss > 0 and self.rng.random() < self.loss:
             why = 'random'
+        return why
+
+    def send(self, packet, now):
+        """
+        Put one packet on the link, or drop it.
+
+        Args:
+            packet: The Packet.
+            now: Current virtual time.
+
+        Returns:
+            bool: True when the packet will arrive, False when it was dropped.
+        """
+        self.sent += 1
+        why = self.drop_reason(packet, now)
         if why is not None:
             self.dropped.append((now, packet, why))
             return False
         arrive = now + self.delay
+        extra = self.delay_if(packet, now) if self.delay_if is not None else None
+        if extra:
+            self.delayed.append((now, packet, extra))
+            arrive += extra
         if self.reorder > 0 and self.rng.random() < self.reorder:
             self.held_back += 1
             arrive += self.reorder_delay
-        self._schedule(arrive, packet)
+        self.schedule(arrive, packet)
         if self.duplicate > 0 and self.rng.random() < self.duplicate:
             self.copies += 1
-            self._schedule(arrive, packet)
+            self.schedule(arrive, packet)
         return True
 
-    def _schedule(self, when, packet):
+    def schedule(self, when, packet):
         """
         Queue a packet to arrive at ``when``; equal times keep sending order.
 
@@ -225,7 +250,6 @@ class Reader:
         self.due = start
         self.total = 0
         self.paused = False
-        self.pause_started = None
 
     def next_time(self, receiver, now):
         """
@@ -240,7 +264,7 @@ class Reader:
             to read (reading everything at once).
         """
         if self.chunk is None:
-            return now if receiver.ready else None
+            return now if receiver.buffered_data else None
         return self.due
 
     def read(self, receiver, now):
@@ -262,7 +286,6 @@ class Reader:
         if (not self.paused and self.pause_after is not None
                 and self.total >= self.pause_after):
             self.paused = True
-            self.pause_started = now
             self.due = now + self.pause
         return data
 
@@ -271,46 +294,44 @@ class Simulation:
     """
     One transfer from a TcpSender to a TcpReceiver over two links.
 
-    The endpoint glue does what the connection will do: every segment the
+    The endpoint glue does what the connection does: every segment the
     sender returns goes on the data link; on the receiving side an ACK
-    ``(ack=receiver.rcv_nxt, window=receiver.window())`` goes on the ACK
-    link whenever ``on_segment`` or ``on_tick`` gives a reason, and after
+    ``(ack=receiver.expected_seq_num, window=receiver.rwnd())`` goes on the
+    ACK link whenever ``on_segment`` or ``on_tick`` gives a reason, and after
     the application reads when ``window_update_due()`` holds. ACKs carry
-    no data. With ``close`` the sender closes once its data is ACKed.
+    no data. With ``close`` the sender closes once all its data is ACKed.
 
     Args:
-        data: Bytes to transfer.
+        data: Bytes the application writes at t = 0.
+        writes: Later writes, as (time, bytes) pairs.
         mss: Largest payload of one segment.
-        rcvbuf: Receiver's RcvBuffer; also the sender's first rwnd.
-        ssthresh: First ssthresh.
+        rcv_buffer: Receiver's RcvBuffer; also the sender's first rwnd.
+            65535 by default, a Linux-like client window.
+        ssthresh: First ssthresh (64 KB, slide 3-125).
         delay: One-way delay of both links when they are not given.
         data_link: Link for sender to receiver, or None for a clean one.
         ack_link: Link for receiver to sender, or None for a clean one.
         reader: Reader model, or None to read everything at once.
         close: Send and ACK a FIN after the data.
         time_limit: Virtual seconds before the run fails.
-        iss: Sequence number of the first data byte.
-        delayed_ack: Receiver's delayed-ACK time.
-        initial_rto: First timeout of the RTT estimator.
-        min_rto: Smallest timeout.
-        max_rto: Largest timeout.
-        max_retries: Timeouts in a row before the sender gives up.
-        persist_min: First zero-window probe interval.
-        persist_max: Largest zero-window probe interval.
+        initial_seq_num: Sequence number of the first data byte.
+        first_timeout_interval: TimeoutInterval before the first SampleRTT.
+        min_timeout_interval: Smallest TimeoutInterval.
     """
 
-    def __init__(self, data, mss=1460, rcvbuf=32768, ssthresh=32768, delay=0.01,
-                 data_link=None, ack_link=None, reader=None, close=False,
-                 time_limit=120.0, iss=1000, delayed_ack=0.1, initial_rto=1.0,
-                 min_rto=0.2, max_rto=4.0, max_retries=8, persist_min=0.2,
-                 persist_max=2.0):
+    def __init__(self, data, writes=(), mss=1460, rcv_buffer=65535,
+                 ssthresh=INITIAL_SSTHRESH, delay=0.01, data_link=None, ack_link=None,
+                 reader=None, close=False, time_limit=120.0, initial_seq_num=1000,
+                 first_timeout_interval=FIRST_TIMEOUT_INTERVAL,
+                 min_timeout_interval=MIN_TIMEOUT_INTERVAL):
         """
         Build both endpoints and both links.
 
         Args:
-            data: Bytes to transfer.
+            data: Bytes the application writes at t = 0.
+            writes: Later writes, as (time, bytes) pairs.
             mss: Largest payload of one segment.
-            rcvbuf: Receiver's RcvBuffer; also the sender's first rwnd.
+            rcv_buffer: Receiver's RcvBuffer; also the sender's first rwnd.
             ssthresh: First ssthresh.
             delay: One-way delay of links that are not given.
             data_link: Link for sender to receiver, or None.
@@ -318,17 +339,15 @@ class Simulation:
             reader: Reader model, or None to read everything at once.
             close: Send and ACK a FIN after the data.
             time_limit: Virtual seconds before the run fails.
-            iss: Sequence number of the first data byte.
-            delayed_ack: Receiver's delayed-ACK time.
-            initial_rto: First timeout.
-            min_rto: Smallest timeout.
-            max_rto: Largest timeout.
-            max_retries: Timeouts in a row before giving up.
-            persist_min: First zero-window probe interval.
-            persist_max: Largest zero-window probe interval.
+            initial_seq_num: Sequence number of the first data byte.
+            first_timeout_interval: TimeoutInterval before the first SampleRTT.
+            min_timeout_interval: Smallest TimeoutInterval.
         """
         self.data = bytes(data)
+        self.writes = sorted((when, bytes(chunk)) for when, chunk in writes)
+        self.sent = self.data + b"".join(chunk for _, chunk in self.writes)
         self.close = close
+        self.closed = False
         self.time_limit = time_limit
         self.clock = VirtualClock()
         self.data_link = data_link or Link(delay)
@@ -337,42 +356,40 @@ class Simulation:
         self.delivered = bytearray()
         self.sender_events = []
         self.receiver_events = []
+        self.sender = None
 
-        rtt = RttEstimator(initial_rto, min_rto, max_rto)
-        cc = RenoCongestion(mss, ssthresh, self._sender_event)
-        self.sender = TcpSender(iss, mss, rcvbuf, rtt, cc, max_retries, persist_min,
-                                persist_max, self._sender_event)
-        self.receiver = TcpReceiver(iss, rcvbuf, delayed_ack, self._receiver_event)
-
-    # ------------------------------------------------------------------
-    # Event recording
-    # ------------------------------------------------------------------
+        rtt = RttEstimator(first_timeout_interval, min_timeout_interval)
+        reno = RenoCongestion(mss, ssthresh, self.sender_log)
+        self.sender = TcpSender(initial_seq_num, mss, rcv_buffer, reno, rtt, self.sender_log)
+        self.receiver = TcpReceiver(initial_seq_num, rcv_buffer, self.receiver_log)
 
     def sender_state(self):
         """
         Give the sender's numbers, as the trace columns name them.
 
         Returns:
-            dict: cwnd, ssthresh, rwnd, in_flight, snd_una, snd_nxt, state.
+            dict: cwnd, ssthresh, rwnd, in_flight, send_base, next_seq_num, state.
         """
         tx = self.sender
-        return {'cwnd': tx.cc.cwnd, 'ssthresh': tx.cc.ssthresh, 'rwnd': tx.rwnd,
-                'in_flight': tx.bytes_in_flight(), 'snd_una': tx.snd_una,
-                'snd_nxt': tx.snd_nxt, 'state': tx.cc.state}
+        return {'cwnd': tx.reno.cwnd, 'ssthresh': tx.reno.ssthresh, 'rwnd': tx.rwnd,
+                'in_flight': tx.in_flight(), 'send_base': tx.send_base,
+                'next_seq_num': tx.next_seq_num, 'state': tx.reno.state}
 
     def receiver_state(self):
         """
         Give the receiver's numbers.
 
         Returns:
-            dict: rcv_nxt, window, ready, out_of_order (bytes held), fin_received.
+            dict: expected_seq_num, rwnd, buffered, out_of_order (bytes held),
+            fin_received.
         """
         rx = self.receiver
         held = sum(len(part) for part in rx.out_of_order.values())
-        return {'rcv_nxt': rx.rcv_nxt, 'window': rx.window(), 'ready': len(rx.ready),
-                'out_of_order': held, 'fin_received': rx.fin_received}
+        return {'expected_seq_num': rx.expected_seq_num, 'rwnd': rx.rwnd(),
+                'buffered': len(rx.buffered_data), 'out_of_order': held,
+                'fin_received': rx.fin_received}
 
-    def _sender_event(self, name, **details):
+    def sender_log(self, name, **details):
         """
         Record an event of the sender or its Reno machine.
 
@@ -380,11 +397,11 @@ class Simulation:
             name: Event name.
             details: Event details.
         """
-        if not hasattr(self, 'sender'):
+        if self.sender is None:
             return
         self.sender_events.append(Event(self.clock.now, name, details, self.sender_state()))
 
-    def _receiver_event(self, name, **details):
+    def receiver_log(self, name, **details):
         """
         Record an event of the receiver side.
 
@@ -395,11 +412,7 @@ class Simulation:
         self.receiver_events.append(Event(self.clock.now, name, details,
                                           self.receiver_state()))
 
-    # ------------------------------------------------------------------
-    # Endpoint glue
-    # ------------------------------------------------------------------
-
-    def _transmit(self, segments):
+    def transmit(self, segments):
         """
         Put the sender's segments on the data link.
 
@@ -410,7 +423,7 @@ class Simulation:
             packet = Packet(seg.seq, seg.payload, seg.fin, seg.kind, None, None, None)
             self.data_link.send(packet, self.clock.now)
 
-    def _send_ack(self, reason):
+    def send_ack(self, reason):
         """
         Send a pure ACK from the receiver with its current number and window.
 
@@ -418,44 +431,66 @@ class Simulation:
             reason: Why the ACK goes out ('delayed', 'duplicate', 'window_update', ...).
         """
         rx = self.receiver
-        window = rx.window()
-        packet = Packet(None, b"", False, 'ack', rx.rcv_nxt, window, reason)
-        self.ack_link.send(packet, self.clock.now)
+        ack = rx.expected_seq_num
+        window = rx.rwnd()
+        self.ack_link.send(Packet(None, b"", False, 'ack', ack, window, reason),
+                           self.clock.now)
         rx.ack_sent(window)
-        self._receiver_event('ACK_SENT', ack=rx.rcv_nxt, window=window, reason=reason)
+        self.receiver_log('ACK_SENT', ack=ack, rwnd=window, reason=reason)
 
-    def _on_data_arrival(self):
+    def on_data_arrival(self):
         """Hand the next data packet to the receiver and ACK when asked."""
         packet = self.data_link.pop()
         reason = self.receiver.on_segment(packet.seq, packet.payload, packet.fin,
                                           self.clock.now)
         if reason:
-            self._send_ack(reason)
+            self.send_ack(reason)
 
-    def _on_ack_arrival(self):
+    def on_ack_arrival(self):
         """Hand the next ACK to the sender and send what it returns."""
         packet = self.ack_link.pop()
-        self._transmit(self.sender.on_ack(packet.ack, packet.window, False, self.clock.now))
+        self.transmit(self.sender.on_ack(packet.ack, packet.window, False, self.clock.now))
 
-    def _on_sender_timer(self):
-        """Run the sender's retransmission and persist timers."""
-        self._transmit(self.sender.on_tick(self.clock.now))
+    def on_sender_timer(self):
+        """Run the sender's timer and probe timer."""
+        self.transmit(self.sender.on_tick(self.clock.now))
 
-    def _on_receiver_timer(self):
+    def on_receiver_timer(self):
         """Run the receiver's delayed-ACK timer."""
         reason = self.receiver.on_tick(self.clock.now)
         if reason:
-            self._send_ack(reason)
+            self.send_ack(reason)
 
-    def _on_read(self):
+    def on_read(self):
         """Let the application read, then send a window update when due."""
         self.delivered.extend(self.reader.read(self.receiver, self.clock.now))
         if self.receiver.window_update_due():
-            self._send_ack('window_update')
+            self.send_ack('window_update')
 
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
+    def on_write(self):
+        """Hand the next later write of the application to the sender."""
+        _, chunk = self.writes.pop(0)
+        self.transmit(self.sender.send_data(chunk, self.clock.now))
+
+    def sender_deadline(self):
+        """
+        Give the earliest of the sender's two timers.
+
+        Returns:
+            float or None: The time, or None when both are stopped.
+        """
+        times = [t for t in (self.sender.timer_deadline, self.sender.probe_deadline)
+                 if t is not None]
+        return min(times) if times else None
+
+    def receiver_deadline(self):
+        """
+        Give the time of the receiver's delayed ACK.
+
+        Returns:
+            float or None: The time, or None when no ACK is pending.
+        """
+        return self.receiver.ack_deadline if self.receiver.ack_pending else None
 
     def finished(self):
         """
@@ -465,29 +500,32 @@ class Simulation:
             bool: True when the application read every byte, the sender has
             every byte ACKed and, with ``close``, the FIN was received and ACKed.
         """
-        if len(self.delivered) < len(self.data) or not self.sender.data_acked():
+        if self.writes or len(self.delivered) < len(self.sent):
+            return False
+        if not self.sender.data_acked():
             return False
         if self.close:
             return self.sender.fin_acked() and self.receiver.fin_received
         return True
 
-    def _next_action(self):
+    def next_action(self):
         """
         Pick what happens next in virtual time.
 
         Equal times go in this order: data arrival, ACK arrival, sender
-        timers, receiver timer, application read.
+        timers, receiver timer, application read, application write.
 
         Returns:
             tuple: (time, action), or (None, None) when nothing is left.
         """
         now = self.clock.now
         candidates = (
-            (self.data_link.next_time(), self._on_data_arrival),
-            (self.ack_link.next_time(), self._on_ack_arrival),
-            (self.sender.next_deadline(), self._on_sender_timer),
-            (self.receiver.next_deadline(), self._on_receiver_timer),
-            (self.reader.next_time(self.receiver, now), self._on_read),
+            (self.data_link.next_time(), self.on_data_arrival),
+            (self.ack_link.next_time(), self.on_ack_arrival),
+            (self.sender_deadline(), self.on_sender_timer),
+            (self.receiver_deadline(), self.on_receiver_timer),
+            (self.reader.next_time(self.receiver, now), self.on_read),
+            (self.writes[0][0] if self.writes else None, self.on_write),
         )
         best = (None, None)
         for when, action in candidates:
@@ -495,7 +533,7 @@ class Simulation:
                 best = (when, action)
         return best
 
-    def _fail(self, why):
+    def fail(self, why):
         """
         Stop the run with a summary of where it got stuck.
 
@@ -506,45 +544,47 @@ class Simulation:
             SimulationFailed: Always.
         """
         tx, rx = self.sender, self.receiver
+        timeouts = sum(1 for event in self.sender_events if event.name == 'TIMEOUT')
         raise SimulationFailed(
-            '%s at t=%.3f: delivered %d of %d, snd_una=%d snd_nxt=%d rwnd=%d cwnd=%d '
-            'rcv_nxt=%d window=%d timeouts=%d'
-            % (why, self.clock.now, len(self.delivered), len(self.data), tx.snd_una,
-               tx.snd_nxt, tx.rwnd, tx.cc.cwnd, rx.rcv_nxt, rx.window(), tx.timeouts))
+            '%s at t=%.3f: delivered %d of %d, send_base=%d next_seq_num=%d rwnd=%d '
+            'cwnd=%d expected_seq_num=%d receiver rwnd=%d timeouts=%d'
+            % (why, self.clock.now, len(self.delivered), len(self.sent), tx.send_base,
+               tx.next_seq_num, tx.rwnd, tx.reno.cwnd, rx.expected_seq_num, rx.rwnd(),
+               timeouts))
 
     def run(self):
         """
         Run the transfer to the end.
 
         Returns:
-            Result: Delivered bytes, both event lists, the virtual time used,
-            the endpoints and the links.
+            Result: Delivered and sent bytes, both event lists, the virtual
+            time used, the endpoints and the links.
 
         Raises:
-            SimulationFailed: On the time limit, a give-up, or when nothing is
-            left to happen before the transfer finished.
+            SimulationFailed: On the time limit, or when nothing is left to
+            happen before the transfer finished.
         """
-        self._transmit(self.sender.write(self.data, self.clock.now))
+        self.transmit(self.sender.send_data(self.data, self.clock.now))
         steps = 0
         while not self.finished():
-            if self.close and self.sender.data_acked() and not self.sender.fin_requested:
-                self._transmit(self.sender.close(self.clock.now))
+            if (self.close and not self.closed and not self.writes
+                    and self.sender.data_acked()):
+                self.closed = True
+                self.transmit(self.sender.close(self.clock.now))
                 continue
-            if self.sender.gave_up:
-                self._fail('sender gave up')
-            when, action = self._next_action()
+            when, action = self.next_action()
             if when is None:
-                self._fail('nothing left to happen')
+                self.fail('nothing left to happen')
             if when > self.time_limit:
-                self._fail('time limit %.1f s' % self.time_limit)
+                self.fail('time limit %.1f s' % self.time_limit)
             steps += 1
             if steps > 1000000:
-                self._fail('too many steps')
+                self.fail('too many steps')
             self.clock.advance(when)
             action()
-        return Result(bytes(self.delivered), self.sender_events, self.receiver_events,
-                      self.clock.now, self.sender, self.receiver, self.data_link,
-                      self.ack_link)
+        return Result(bytes(self.delivered), self.sent, self.sender_events,
+                      self.receiver_events, self.clock.now, self.sender, self.receiver,
+                      self.data_link, self.ack_link)
 
 
 def run_transfer(data, **options):
@@ -552,7 +592,7 @@ def run_transfer(data, **options):
     Run one simulated transfer.
 
     Args:
-        data: Bytes to transfer.
+        data: Bytes the application writes at t = 0.
         options: Keyword arguments of ``Simulation``.
 
     Returns:
