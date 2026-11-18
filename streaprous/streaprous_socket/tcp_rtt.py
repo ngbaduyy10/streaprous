@@ -1,82 +1,88 @@
-"""Timeout estimator for the TCP sender.
-
-The sender needs a retransmission timeout that follows the real round trip time:
-too short and it resends segments that were only slow, too long and it waits
-for nothing after a loss. This module keeps the running estimate of slides
-3-81 to 3-83 and the back-off of slide 3-84.
 """
+StreapRous TCP round trip time
+Keeps EstimatedRTT, DevRTT and TimeoutInterval for the sender's timer (slides 3-81 to 3-83).
+"""
+
+ALPHA = 0.125                      # slide 3-82
+BETA = 0.25                        # slide 3-83
+FIRST_TIMEOUT_INTERVAL = 1.0       # extra: before the first SampleRTT
+MIN_TIMEOUT_INTERVAL = 0.2         # extra: never below 0.2 s
 
 
 class RttEstimator:
-    """Keeps EstimatedRTT, DevRTT and the current timeout (TimeoutInterval).
+    """Turns SampleRTT values into the TimeoutInterval of the sender's timer.
 
     Attributes:
-         estimated_rtt  smoothed round trip time, None until the first sample
-         dev_rtt        smoothed deviation of the samples, None until the first sample
-         rto            current timeout in seconds, starts at initial_rto
+         estimated_rtt     EWMA of SampleRTT in seconds, None until the first sample
+         dev_rtt           EWMA of how far SampleRTT is from EstimatedRTT, None until then
+         timeout_interval  how long the timer waits, in seconds
     """
 
-    def __init__(self, initial_rto, min_rto, max_rto, alpha=0.125, beta=0.25):
-        """Creates an estimator that has not seen any sample yet.
+    def __init__(self, first_timeout_interval=FIRST_TIMEOUT_INTERVAL,
+                 min_timeout_interval=MIN_TIMEOUT_INTERVAL):
+        """Starts with no SampleRTT yet.
+
+        extra: TimeoutInterval is 1 s before the first SampleRTT. The timer needs
+        a value before any ACK came back, and the slides give none.
 
         Args:
-             initial_rto  timeout used before the first sample, in seconds
-             min_rto      the timeout never goes below this
-             max_rto      the timeout never goes above this
-             alpha=0.125  weight of the new sample in EstimatedRTT (slide 3-82)
-             beta=0.25    weight of the new deviation in DevRTT (slide 3-83)
+             first_timeout_interval  TimeoutInterval before the first sample (1 s)
+             min_timeout_interval    the lowest TimeoutInterval allowed (0.2 s)
         """
-        self.initial_rto = initial_rto
-        self.min_rto = min_rto
-        self.max_rto = max_rto
-        self.alpha = alpha
-        self.beta = beta
+        self.min_timeout_interval = min_timeout_interval
         self.estimated_rtt = None
         self.dev_rtt = None
-        self.rto = initial_rto
+        self.timeout_interval = first_timeout_interval
 
     def add_sample(self, sample_rtt):
-        """Folds one measured round trip time into the estimates.
+        """Takes one SampleRTT and updates the estimates in the slides' order.
 
-        EstimatedRTT is an exponentially weighted moving average of the samples
-        (slide 3-82): old samples count less and less. DevRTT does the same for
-        how far a sample is from EstimatedRTT (slide 3-83), so a jumpy network
-        gets a bigger safety margin. The timeout is EstimatedRTT + 4 * DevRTT
-        (slide 3-83), kept between min_rto and max_rto.
+        A later sample runs slide 3-82 (EstimatedRTT) first, then slide 3-83
+        (DevRTT, with the new EstimatedRTT), then TimeoutInterval.
 
-        The first sample has nothing to average with, so EstimatedRTT = sample
-        and DevRTT = sample / 2. This start comes from RFC 6298, not from the
-        slides. DevRTT is updated before EstimatedRTT so that it uses the old
-        EstimatedRTT, as the formula on slide 3-83 does.
+        extra: the first SampleRTT starts both averages: EstimatedRTT = SampleRTT
+        and DevRTT = SampleRTT/2, because each EWMA needs an old value.
 
         Args:
              sample_rtt  measured round trip time in seconds
-
-        Returns:
-             the new timeout in seconds
         """
         if self.estimated_rtt is None:
             self.estimated_rtt = sample_rtt
             self.dev_rtt = sample_rtt / 2
         else:
-            self.dev_rtt = ((1 - self.beta) * self.dev_rtt
-                            + self.beta * abs(sample_rtt - self.estimated_rtt))
-            self.estimated_rtt = ((1 - self.alpha) * self.estimated_rtt
-                                  + self.alpha * sample_rtt)
-        timeout = self.estimated_rtt + 4 * self.dev_rtt
-        self.rto = min(max(timeout, self.min_rto), self.max_rto)
-        return self.rto
+            self.update_estimated_rtt(sample_rtt)
+            self.update_dev_rtt(sample_rtt)
+        self.update_timeout_interval()
 
-    def back_off(self):
-        """Doubles the timeout after a timeout event.
+    def update_estimated_rtt(self, sample_rtt):
+        """Moves EstimatedRTT towards the new sample (slide 3-82).
 
-        When the timer expires, the network is probably busy, so the sender
-        waits twice as long before the next try (slide 3-84). The doubled value
-        is capped at max_rto. EstimatedRTT and DevRTT are not touched: the next
-        sample recomputes the timeout from them.
+        EstimatedRTT = (1 - alpha)*EstimatedRTT + alpha*SampleRTT, alpha = 0.125.
 
-        Returns:
-             the new timeout in seconds
+        Args:
+             sample_rtt  measured round trip time in seconds
         """
-        self.rto = min(self.rto * 2, self.max_rto)
-        return self.rto
+        self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
+
+    def update_dev_rtt(self, sample_rtt):
+        """Moves DevRTT towards the new deviation (slide 3-83).
+
+        DevRTT = (1 - beta)*DevRTT + beta*|SampleRTT - EstimatedRTT|, beta = 0.25.
+        EstimatedRTT here is the new one, already updated by slide 3-82.
+
+        Args:
+             sample_rtt  measured round trip time in seconds
+        """
+        deviation = abs(sample_rtt - self.estimated_rtt)
+        self.dev_rtt = (1 - BETA) * self.dev_rtt + BETA * deviation
+
+    def update_timeout_interval(self):
+        """Sets the timer's interval from the two averages (slide 3-83).
+
+        TimeoutInterval = EstimatedRTT + 4*DevRTT: the estimate plus a safety margin.
+
+        extra: never below 0.2 s. A receiver may wait up to 500 ms before it ACKs
+        (slide 3-85), so a shorter timer resends segments that were not lost.
+        """
+        timeout = self.estimated_rtt + 4 * self.dev_rtt
+        self.timeout_interval = max(self.min_timeout_interval, timeout)

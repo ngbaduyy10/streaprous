@@ -1,601 +1,420 @@
 """
-TCP sender for StreapRous.
-
-Keeps the sending side of one connection: the data is cut into segments of
-at most one MSS, one retransmission timer covers the oldest unACKed byte
-(slide 3-84), the third duplicate ACK triggers a fast retransmit (slide 3-88),
-and at most min(cwnd, rwnd) bytes are in flight (slides 3-122, 3-94). cwnd
-comes from the Reno machine of slide 3-125, rwnd from the receiver's ACKs.
-When the receiver's window is 0, a one-byte probe asks again until it opens.
-
-The class never touches sockets, threads or the clock: the caller passes ACK
-numbers and the current time ``now`` and sends the segments the methods
-return. Sequence numbers are plain ints (already unwrapped).
+StreapRous TCP sender
+The sending side of one connection: segments with seq #, one timer, ACKs, fast retransmit,
+at most min(cwnd, rwnd) bytes in flight, and zero-window probes.
+The class never touches sockets or the clock: the caller passes ACK numbers (already
+unwrapped) and the time now, and puts the returned segments on the wire.
 """
 
 from collections import namedtuple
 
-# One segment to put on the wire. kind is 'new' (first transmission),
-# 'retransmit' (resent after going back), 'timeout', 'fast', 'probe' or 'fin'.
+from .tcp_trace import no_log
+
+# kind: 'new' (first transmission of data), 'fin' (first FIN), 'timeout', 'fast', 'probe'
 SendSegment = namedtuple('SendSegment', ['seq', 'payload', 'fin', 'kind'])
+
+PROBE_INTERVAL = 0.5                 # extra: one data byte every 0.5 s while rwnd is 0
 
 
 class TcpSender:
-    """
-    Sending side of one TCP connection.
+    """The TCP sender of slides 3-84 and 3-146, limited by cwnd and rwnd.
 
-    ``snd_una`` is the oldest unACKed byte, ``snd_nxt`` the next byte to
-    send and ``snd_max`` one past the highest byte ever sent. After a
-    timeout ``snd_nxt`` goes back to ``snd_una`` and the bytes up to
-    ``snd_max`` are sent again as the window allows.
-
-    Args:
-        iss: Sequence number of our first data byte.
-        mss: Largest payload of one segment in bytes.
-        rwnd: First receive window of the peer in bytes.
-        rtt: RttEstimator that gives the timeout (slides 3-82 to 3-84).
-        cc: RenoCongestion that gives cwnd (slide 3-125).
-        max_retries: Timeouts in a row before we give up.
-        persist_min: First zero-window probe interval in seconds.
-        persist_max: Largest zero-window probe interval in seconds.
-        on_event: Callback ``on_event(name, **details)`` for trace events.
+    Attributes:
+         send_base       oldest unACKed byte (SendBase); SendBase-1 is the last ACKed byte
+         next_seq_num    seq # of the next new byte to send (NextSeqNum)
+         rwnd            the window field of the latest acceptable ACK
+         data            every byte the application gave us; byte i has seq #
+                         initial_seq_num + i
+         fin_seq         seq # of our FIN, None until close
+         timer_deadline  when the one timer expires, None when it is stopped
+         rtt_timed_seq   the ACK number that ends the timed segment, None if none is timed
+         rtt_sent_at     when the timed segment was sent
+         probe_seq       seq # of the probe byte sent last, None if none waits
+         probe_deadline  when the next probe goes out, None when no probe is needed
     """
 
-    def __init__(self, iss, mss, rwnd, rtt, cc, max_retries, persist_min, persist_max,
-                 on_event=None):
-        """
-        Start with nothing to send, no timer and no probe.
+    def __init__(self, initial_seq_num, mss, rwnd, reno, rtt, log=no_log):
+        """Starts with nothing sent: NextSeqNum = SendBase = InitialSeqNum (slide 3-146).
 
         Args:
-            iss: Sequence number of our first data byte.
-            mss: Largest payload of one segment in bytes.
-            rwnd: First receive window of the peer in bytes.
-            rtt: RttEstimator that gives the timeout.
-            cc: RenoCongestion that gives cwnd.
-            max_retries: Timeouts in a row before we give up.
-            persist_min: First zero-window probe interval in seconds.
-            persist_max: Largest zero-window probe interval in seconds.
-            on_event: Callback ``on_event(name, **details)``; None means no events.
+             initial_seq_num  seq # of our first data byte
+             mss              largest payload of one segment in bytes
+             rwnd             first window of the receiver in bytes
+             reno             RenoCongestion that gives cwnd
+             rtt              RttEstimator that gives TimeoutInterval
+             log              called as log(event, **details) for the trace
         """
         self.mss = mss
+        self.reno = reno
         self.rtt = rtt
-        self.cc = cc
-        self.max_retries = max_retries
-        self.persist_min = persist_min
-        self.persist_max = persist_max
-        self.on_event = on_event or (lambda name, **details: None)
-
-        self.snd_una = iss
-        self.snd_nxt = iss
-        self.snd_max = iss
+        self.log = log
+        self.initial_seq_num = initial_seq_num
+        self.send_base = initial_seq_num
+        self.next_seq_num = initial_seq_num
         self.rwnd = rwnd
-        self.buffer = b""
-        self.buffer_seq = iss
-        self.fin_requested = False
+        self.data = b""
         self.fin_seq = None
-
         self.timer_deadline = None
-        self.timeouts_in_row = 0
-        self.timed_end = None
-        self.timed_at = None
-        self.persist_deadline = None
-        self.persist_interval = persist_min
+        self.rtt_timed_seq = None
+        self.rtt_sent_at = None
         self.probe_seq = None
-        self.gave_up = False
+        self.probe_deadline = None
 
-        self.segments_sent = 0
-        self.retransmits = 0
-        self.timeouts = 0
-        self.fast_retransmits = 0
-        self.probes = 0
+    def send_data(self, data, now):
+        """Event: data received from application (slide 3-84).
 
-    # ------------------------------------------------------------------
-    # Calls from the connection
-    # ------------------------------------------------------------------
-
-    def write(self, data, now):
-        """
-        Take the next block of application data and send what the window allows.
-
-        The previous block must be fully ACKed first, so the buffer only
-        ever holds bytes from ``snd_una`` on.
+        The bytes join the end of the byte stream, then go out as allowed.
 
         Args:
-            data: Bytes to send.
-            now: Current time in seconds.
+             data  bytes from the application
+             now   current time in seconds
 
         Returns:
-            list: SendSegment values to transmit now.
+             list of SendSegment to put on the wire
         """
-        if not self.data_acked():
-            raise ValueError("write() before the previous data was ACKed")
-        self.buffer = bytes(data)
-        self.buffer_seq = self.snd_una
-        return self._send_allowed(now)
+        self.data = self.data + bytes(data)
+        return self.send_allowed(now)
 
     def close(self, now):
-        """
-        Ask for a FIN after the last data byte.
+        """Asks for our FIN after the last data byte (slide 3-103).
 
-        The FIN takes one sequence number and goes out once every data byte
-        has been sent; the same timer retransmits it until it is ACKed.
-
-        Args:
-            now: Current time in seconds.
-
-        Returns:
-            list: SendSegment values to transmit now.
-        """
-        if self.fin_requested:
-            return []
-        self.fin_requested = True
-        self.fin_seq = self.data_end()
-        return self._send_allowed(now)
-
-    def on_ack(self, ack, window, has_data, now):
-        """
-        Handle the ACK number and window of one received segment.
-
-        An ACK above ``snd_una`` is a new ACK. An ACK equal to ``snd_una``
-        is a duplicate only when data is outstanding, the segment carries
-        no data and the window did not change (RFC 5681, background); other
-        such ACKs just update the window. ACKs below ``snd_una`` or above
-        anything we sent are ignored.
+        "send TCP segment with FIN bit = 1": the FIN takes one seq #, goes out
+        after the data, and the timer resends it until it is ACKed.
 
         Args:
-            ack: ACK number, already unwrapped near ``snd_una``.
-            window: Window field of the segment in bytes.
-            has_data: True when the segment carries payload.
-            now: Current time in seconds.
+             now  current time in seconds
 
         Returns:
-            list: SendSegment values to transmit now.
+             list of SendSegment to put on the wire
         """
-        if self.gave_up:
-            return []
-        limit = self.snd_max
+        if self.fin_seq is None:
+            self.fin_seq = self.data_end()
+        return self.send_allowed(now)
+
+    def on_ack(self, ack, window, carries_data, now):
+        """Event: ACK received, with ACK field value ack (slides 3-84, 3-146).
+
+        An ACK above SendBase is a new ACK. An ACK below SendBase is old: slide 3-146
+        acts only when y > SendBase.
+
+        extra: an ACK for bytes we never sent is ignored; it cannot be a real ACK.
+        extra: an ACK equal to SendBase is a duplicate ACK only while data is in
+        flight and when it carries no data and the same window; anything else
+        only updates rwnd.
+
+        Args:
+             ack           ACK number, already unwrapped
+             window        window field of the segment in bytes
+             carries_data  True when the segment has payload or FIN
+             now           current time in seconds
+
+        Returns:
+             list of SendSegment to put on the wire
+        """
+        highest = self.next_seq_num
         if self.probe_seq is not None:
-            limit = max(limit, self.probe_seq + 1)
-        if ack < self.snd_una or ack > limit:
+            highest = max(self.next_seq_num, self.probe_seq + 1)
+        if ack < self.send_base or ack > highest:
             return []
-        if ack > self.snd_una:
-            self._on_new_ack(ack, window, now)
-            return self._send_allowed(now)
-        duplicate = (self.snd_nxt > self.snd_una and not has_data
-                     and window == self.rwnd)
-        self._update_rwnd(window)
+        if ack > self.send_base:
+            self.update_rwnd(window)
+            self.on_new_ack(ack, now)
+            return self.send_allowed(now)
+        duplicate = self.in_flight() > 0 and not carries_data and window == self.rwnd
+        self.update_rwnd(window)
         if duplicate:
-            return self._on_duplicate_ack(now)
-        return self._send_allowed(now)
+            return self.on_duplicate_ack(now)
+        return self.send_allowed(now)
 
     def on_tick(self, now):
-        """
-        Run the retransmission timer and the persist timer.
+        """Runs the timer and the probe timer.
 
         Args:
-            now: Current time in seconds.
+             now  current time in seconds
 
         Returns:
-            list: SendSegment values to transmit now.
+             list of SendSegment to put on the wire
         """
-        if self.gave_up:
-            return []
-        out = []
+        segments = []
         if self.timer_deadline is not None and now >= self.timer_deadline:
-            out.extend(self._on_timeout(now))
-        if self.persist_deadline is not None and now >= self.persist_deadline:
-            out.extend(self._send_window_probe(now))
-        return out
+            segments = segments + self.on_timeout(now)
+        if self.probe_deadline is not None and now >= self.probe_deadline:
+            segments = segments + self.send_probe(now)
+        return segments
 
-    def bytes_in_flight(self):
-        """
-        Count bytes sent but not ACKed yet.
+    def in_flight(self):
+        """Counts bytes sent but not ACKed: LastByteSent - LastByteAcked (slide 3-122).
 
-        Returns:
-            int: ``snd_nxt - snd_una`` (the FIN counts as one byte).
+        LastByteSent = NextSeqNum - 1 and LastByteAcked = SendBase - 1, so this is
+        NextSeqNum - SendBase. The FIN counts as one byte; a probe byte never counts.
         """
-        return self.snd_nxt - self.snd_una
+        return self.next_seq_num - self.send_base
 
     def data_end(self):
-        """
-        Give the sequence number just after the last data byte.
-
-        Returns:
-            int: ``buffer_seq + len(buffer)``.
-        """
-        return self.buffer_seq + len(self.buffer)
+        """Gives the seq # just after the last data byte."""
+        return self.initial_seq_num + len(self.data)
 
     def data_acked(self):
-        """
-        Tell whether every data byte written so far is ACKed.
-
-        Returns:
-            bool: True when ``snd_una`` reached the end of the data.
-        """
-        return self.snd_una >= self.data_end()
+        """Tells whether every data byte is ACKed."""
+        return self.send_base >= self.data_end()
 
     def fin_acked(self):
-        """
-        Tell whether our FIN is ACKed.
+        """Tells whether our FIN is ACKed."""
+        return self.fin_seq is not None and self.send_base > self.fin_seq
 
-        Returns:
-            bool: True when a FIN was asked for and ``snd_una`` is past it.
-        """
-        return self.fin_requested and self.snd_una > self.fin_seq
-
-    def next_deadline(self):
-        """
-        Give the time the caller must call ``on_tick`` next.
-
-        Returns:
-            float or None: The earlier of the retransmission and persist
-            deadlines, or None when neither timer runs.
-        """
-        deadlines = [d for d in (self.timer_deadline, self.persist_deadline)
-                     if d is not None]
-        return min(deadlines) if deadlines else None
-
-    # ------------------------------------------------------------------
-    # Sending
-    # ------------------------------------------------------------------
-
-    def _usable_window(self):
-        """
-        Give how many more bytes may go out now (slides 3-122, 3-94).
-
-        In flight may be at most cwnd (congestion control, slide 3-122) and
-        at most rwnd (flow control, slide 3-94).
-
-        Returns:
-            int: ``min(cwnd, rwnd) - bytes_in_flight()``; may be negative
-            when a window shrank.
-        """
-        return min(self.cc.cwnd, self.rwnd) - self.bytes_in_flight()
-
-    def _send_allowed(self, now):
-        """
-        Transmit new segment(s), as allowed (slide 3-122).
-
-        Sends from ``snd_nxt`` while the usable window lets a segment out.
-        A segment shorter than one MSS waits while data is in flight,
-        unless it is the last piece of data: ACKs will open room for a
-        full one. With nothing in flight a small segment goes out, so a
-        window below one MSS cannot stall us. Bytes below ``snd_max`` are
-        resent after a timeout ('retransmit'). After the data, the FIN goes
-        out without needing window space.
+    def payload(self, seq, length):
+        """Cuts length data bytes starting at seq # seq.
 
         Args:
-            now: Current time in seconds.
+             seq     seq # of the first byte
+             length  number of bytes
+        """
+        start = seq - self.initial_seq_num
+        return self.data[start:start + length]
+
+    def send_allowed(self, now):
+        """Transmit new segment(s), as allowed (slide 3-125).
+
+        Congestion control (slide 3-122): LastByteSent - LastByteAcked <= cwnd.
+        Flow control (slide 3-94): sender limits amount of unACKed ("in-flight")
+        data to received rwnd. So each new segment is at most one MSS and at most
+        min(cwnd, rwnd) - in_flight() bytes. The FIN needs no window space.
+
+        Args:
+             now  current time in seconds
 
         Returns:
-            list: SendSegment values to transmit now.
+             list of SendSegment to put on the wire
         """
-        out = []
-        while True:
-            if self.snd_nxt < self.data_end():
-                remaining = self.data_end() - self.snd_nxt
-                length = min(self.mss, remaining, self._usable_window())
-                if length <= 0:
-                    break
-                if length < self.mss and length < remaining and self.bytes_in_flight() > 0:
-                    break
-                seq = self.snd_nxt
-                resend = seq < self.snd_max
-                if resend:
-                    self._cancel_rtt_timing()
-                elif self.timed_end is None:
-                    self.timed_end = seq + length
-                    self.timed_at = now
-                out.append(self._emit(seq, self._payload(seq, length), False,
-                                      'retransmit' if resend else 'new', resend))
-                self.snd_nxt += length
-                self.snd_max = max(self.snd_max, self.snd_nxt)
-                if self.timer_deadline is None:
-                    self._start_timer(now)
-                self.on_event('RETRANSMIT' if resend else 'SEND', seq=seq, len=length)
-            else:
-                if self.fin_requested and self.snd_nxt == self.fin_seq:
-                    seq = self.snd_nxt
-                    out.append(self._emit(seq, b"", True, 'fin', seq < self.snd_max))
-                    self.snd_nxt += 1
-                    self.snd_max = max(self.snd_max, self.snd_nxt)
-                    if self.timer_deadline is None:
-                        self._start_timer(now)
-                    self.on_event('FIN_SENT', seq=seq)
+        segments = []
+        while self.next_seq_num < self.data_end():
+            room = min(self.reno.cwnd, self.rwnd) - self.in_flight()
+            length = min(self.mss, self.data_end() - self.next_seq_num, room)
+            if length <= 0:
                 break
-        self._check_persist(now)
-        return out
+            segments.append(self.new_segment(length, now))
+        if self.fin_seq is not None and self.next_seq_num == self.fin_seq:
+            segments.append(self.new_fin(now))
+        self.check_probe_timer(now)
+        return segments
 
-    def _payload(self, seq, length):
-        """
-        Cut ``length`` data bytes starting at ``seq`` from the buffer.
+    def new_segment(self, length, now):
+        """Creates segment with seq # NextSeqNum (slides 3-84, 3-146).
 
-        Args:
-            seq: Sequence number of the first byte.
-            length: Number of bytes.
+        slide 3-84: seq # is byte-stream number of first data byte in segment, and
+        start timer if not already running.
 
-        Returns:
-            bytes: The payload.
-        """
-        start = seq - self.buffer_seq
-        return self.buffer[start:start + length]
-
-    def _segment_at_una(self):
-        """
-        Build the payload and FIN flag of the oldest unACKed segment.
-
-        Returns:
-            tuple: (payload, fin) for the segment that starts at ``snd_una``:
-            up to one MSS of data, or the FIN when only the FIN is left.
-        """
-        if self.snd_una < self.data_end():
-            length = min(self.mss, self.data_end() - self.snd_una)
-            return self._payload(self.snd_una, length), False
-        return b"", True
-
-    def _emit(self, seq, payload, fin, kind, resend):
-        """
-        Make one SendSegment and count it.
+        extra: one segment is timed at a time; it gives the next SampleRTT.
 
         Args:
-            seq: Sequence number of the segment.
-            payload: Data bytes (b"" for a FIN).
-            fin: True for the FIN segment.
-            kind: 'new', 'retransmit', 'timeout', 'fast', 'probe' or 'fin'.
-            resend: True when these sequence numbers were sent before.
+             length  payload length in bytes
+             now     current time in seconds
 
         Returns:
-            SendSegment: The segment.
+             the new SendSegment
         """
-        self.segments_sent += 1
-        if resend:
-            self.retransmits += 1
-        return SendSegment(seq, payload, fin, kind)
+        seq = self.next_seq_num
+        if self.rtt_timed_seq is None:
+            self.rtt_timed_seq = seq + length
+            self.rtt_sent_at = now
+        self.next_seq_num = self.next_seq_num + length
+        if self.timer_deadline is None:
+            self.start_timer(now)
+        self.log('SEND', seq=seq, len=length)
+        return SendSegment(seq, self.payload(seq, length), False, 'new')
 
-    # ------------------------------------------------------------------
-    # Timer and RTT
-    # ------------------------------------------------------------------
-
-    def _start_timer(self, now):
-        """
-        Start the one retransmission timer (slide 3-84).
-
-        The timer belongs to the oldest unACKed segment and expires one
-        TimeoutInterval from now.
+    def new_fin(self, now):
+        """Creates our FIN segment; it takes one seq # (slide 3-103).
 
         Args:
-            now: Current time in seconds.
-        """
-        self.timer_deadline = now + self.rtt.rto
+             now  current time in seconds
 
-    def _stop_timer(self):
+        Returns:
+             the FIN SendSegment
         """
-        Stop the retransmission timer (slide 3-84): nothing is outstanding.
+        segment = SendSegment(self.fin_seq, b"", True, 'fin')
+        self.next_seq_num = self.fin_seq + 1
+        if self.timer_deadline is None:
+            self.start_timer(now)
+        self.log('FIN_SENT', seq=self.fin_seq)
+        return segment
+
+    def on_new_ack(self, ack, now):
+        """ACK acknowledges previously unACKed segments (slides 3-84, 3-87, 3-146).
+
+        Update what is known to be ACKed: SendBase = ack. The ACK is cumulative
+        (slide 3-87), so it covers an earlier lost ACK. Then start timer if there are
+        still unACKed segments, else stop it.
+
+        Args:
+             ack  ACK number, above SendBase
+             now  current time in seconds
         """
+        self.send_base = ack
+        self.next_seq_num = max(self.next_seq_num, ack)     # an ACKed probe byte
+        self.probe_seq = None
+        self.take_rtt_sample(ack, now)
+        self.reno.on_new_ack()
+        if self.in_flight() > 0:
+            self.start_timer(now)
+        else:
+            self.stop_timer()
+        self.log('ACK', ack=ack)
+
+    def on_duplicate_ack(self, now):
+        """Counts a duplicate ACK (slides 3-88, 3-125).
+
+        If sender receives 3 additional ACKs for same data, it fast retransmits.
+        In fast recovery each duplicate ACK grows cwnd, so new data may follow.
+
+        Args:
+             now  current time in seconds
+
+        Returns:
+             list of SendSegment to put on the wire
+        """
+        third = self.reno.on_duplicate_ack()
+        self.log('DUPACK', ack=self.send_base, count=self.reno.dup_ack_count)
+        segments = []
+        if third:
+            segments = self.fast_retransmit()
+        return segments + self.send_allowed(now)
+
+    def fast_retransmit(self):
+        """Resend unACKed segment with smallest seq # (slide 3-88).
+
+        Three duplicate ACKs mean later segments arrived, so this one is likely
+        lost: do not wait for the timeout. The timer stays as it is.
+
+        Returns:
+             list with the resent SendSegment
+        """
+        segment = self.resend_oldest('fast')
+        self.log('FAST_RETRANSMIT', seq=segment.seq, len=len(segment.payload))
+        return [segment]
+
+    def on_timeout(self, now):
+        """Event: timeout (slides 3-84, 3-125).
+
+        Retransmit segment that caused timeout, the oldest unACKed one, and restart
+        timer with the same TimeoutInterval. Reno goes back to slow start. Only this
+        one segment is resent: NextSeqNum does not move back.
+
+        Args:
+             now  current time in seconds
+
+        Returns:
+             list with the resent SendSegment, or [] when nothing is in flight
+        """
+        if self.in_flight() == 0:
+            self.stop_timer()
+            return []
+        self.reno.on_timeout()
+        segment = self.resend_oldest('timeout')
+        self.start_timer(now)
+        self.log('TIMEOUT', seq=segment.seq, len=len(segment.payload),
+                 interval=self.rtt.timeout_interval)
+        return [segment]
+
+    def resend_oldest(self, kind):
+        """Builds the unACKed segment with the smallest seq # again (slides 3-84, 3-88).
+
+        It cancels the RTT timing (slide 3-81: ignore retransmissions). The segment
+        is our FIN when only the FIN is unACKed, else up to one MSS of data that
+        never reaches past NextSeqNum.
+
+        Args:
+             kind  'timeout' or 'fast'
+
+        Returns:
+             the SendSegment starting at SendBase
+        """
+        self.rtt_timed_seq = None
+        if self.fin_seq is not None and self.send_base == self.fin_seq:
+            return SendSegment(self.send_base, b"", True, kind)
+        end = min(self.next_seq_num, self.data_end())
+        length = min(self.mss, end - self.send_base)
+        return SendSegment(self.send_base, self.payload(self.send_base, length), False, kind)
+
+    def start_timer(self, now):
+        """Starts the one timer: think of timer as for oldest unACKed segment (slide 3-84).
+
+        It expires one TimeoutInterval from now.
+
+        Args:
+             now  current time in seconds
+        """
+        self.timer_deadline = now + self.rtt.timeout_interval
+
+    def stop_timer(self):
+        """Stops the timer: nothing is unACKed (slide 3-146)."""
         self.timer_deadline = None
 
-    def _cancel_rtt_timing(self):
-        """
-        Forget the segment being timed (slide 3-81: ignore retransmissions).
-        """
-        self.timed_end = None
-        self.timed_at = None
+    def take_rtt_sample(self, ack, now):
+        """Measures SampleRTT when the timed segment is ACKed (slide 3-81).
 
-    def _take_rtt_sample(self, ack, now):
-        """
-        Measure SampleRTT when the timed segment is ACKed (slide 3-81).
-
-        Only one segment is timed at a time, and only a first transmission:
-        an ACK after a retransmission cannot tell which copy it answers, so
-        every retransmission cancels the timing.
+        SampleRTT: measured time from segment transmission until ACK receipt;
+        ignore retransmissions (resend_oldest cancels the timing).
 
         Args:
-            ack: The new ACK number.
-            now: Current time in seconds.
+             ack  the new ACK number
+             now  current time in seconds
         """
-        if self.timed_end is None or ack < self.timed_end:
+        if self.rtt_timed_seq is None or ack < self.rtt_timed_seq:
             return
-        sample = now - self.timed_at
-        self.rtt.add_sample(sample)
-        self._cancel_rtt_timing()
-        self.on_event('RTT', sample=sample, estimated=self.rtt.estimated_rtt,
-                      dev=self.rtt.dev_rtt, rto=self.rtt.rto)
+        sample_rtt = now - self.rtt_sent_at
+        self.rtt.add_sample(sample_rtt)
+        self.rtt_timed_seq = None
+        self.log('RTT', sample=sample_rtt, estimated=self.rtt.estimated_rtt,
+                 dev=self.rtt.dev_rtt, timeout=self.rtt.timeout_interval)
 
-    def _on_timeout(self, now):
-        """
-        Handle an expired retransmission timer (slides 3-84, 3-86).
-
-        The oldest unACKed segment is resent at once, whatever the window,
-        the timeout doubles (slide 3-84) and Reno drops cwnd to one MSS
-        (slide 3-124). ``snd_nxt`` goes back to ``snd_una`` (BSD Reno,
-        background), so the rest of the window is resent as ACKs open it and
-        several losses in one window cost one timeout. After more than
-        ``max_retries`` timeouts in a row we give up. The resent segment is
-        a full one when data allows, so it may reach past ``snd_max``; then
-        ``snd_max`` moves with it, so an ACK for all of it is accepted.
+    def update_rwnd(self, window):
+        """Sets rwnd to received rwnd (slide 3-94).
 
         Args:
-            now: Current time in seconds.
-
-        Returns:
-            list: The retransmitted segment, or [] when nothing was outstanding
-            or we gave up.
-        """
-        if self.snd_una == self.snd_nxt:
-            self._stop_timer()
-            return []
-        self.timeouts_in_row += 1
-        if self.timeouts_in_row > self.max_retries:
-            self.gave_up = True
-            self._stop_timer()
-            self.persist_deadline = None
-            self.on_event('GIVE_UP', reason='timeouts')
-            return []
-        self.timeouts += 1
-        self.rtt.back_off()
-        self.cc.on_timeout()
-        self._cancel_rtt_timing()
-        self.snd_nxt = self.snd_una
-        payload, fin = self._segment_at_una()
-        seq = self.snd_una
-        segment = self._emit(seq, payload, fin, 'timeout', True)
-        self.snd_nxt = seq + (1 if fin else len(payload))
-        self.snd_max = max(self.snd_max, self.snd_nxt)  # may be longer than the first copy
-        self._start_timer(now)
-        self.on_event('TIMEOUT', seq=seq, len=len(payload), rto=self.rtt.rto)
-        return [segment]
-
-    # ------------------------------------------------------------------
-    # ACKs
-    # ------------------------------------------------------------------
-
-    def _on_new_ack(self, ack, window, now):
-        """
-        Handle an ACK that acknowledges new bytes (slides 3-84, 3-87).
-
-        ACKs are cumulative (slide 3-87): every byte below ``ack`` arrived,
-        even bytes we were about to resend after a timeout. The timer is
-        restarted while bytes are still outstanding and stopped otherwise
-        (slide 3-84).
-
-        Args:
-            ack: The ACK number, above ``snd_una``.
-            window: Window field of the segment in bytes.
-            now: Current time in seconds.
-        """
-        acked = ack - self.snd_una
-        self.snd_una = ack
-        self.snd_nxt = max(self.snd_nxt, ack)
-        self.snd_max = max(self.snd_max, self.snd_nxt)  # an ACKed probe byte
-        self.probe_seq = None
-        self._update_rwnd(window)
-        self._take_rtt_sample(ack, now)
-        self.timeouts_in_row = 0
-        self.cc.on_new_ack()
-        if self.snd_una < self.snd_nxt:
-            self._start_timer(now)
-        else:
-            self._stop_timer()
-        self.on_event('ACK', ack=ack, acked=acked)
-
-    def _on_duplicate_ack(self, now):
-        """
-        Handle a duplicate ACK (slide 3-88).
-
-        Reno counts it; on the third one it asks for a fast retransmit of
-        the segment at ``snd_una``. In fast recovery cwnd grows with each
-        duplicate ACK, so new data may go out afterwards.
-
-        Args:
-            now: Current time in seconds.
-
-        Returns:
-            list: SendSegment values to transmit now.
-        """
-        retransmit_now = self.cc.on_duplicate_ack()
-        self.on_event('DUPACK', ack=self.snd_una, count=self.cc.dup_ack_count)
-        out = []
-        if retransmit_now:
-            out.extend(self._fast_retransmit(now))
-        out.extend(self._send_allowed(now))
-        return out
-
-    def _fast_retransmit(self, now):
-        """
-        Resend the segment at ``snd_una`` without waiting for the timer (slide 3-88).
-
-        Three duplicate ACKs mean later segments arrived, so only this one
-        is probably lost. ``snd_nxt`` and the timer stay as they are;
-        ``snd_max`` moves when the resent segment is longer than the first
-        copy, so an ACK for all of it is accepted.
-
-        Args:
-            now: Current time in seconds.
-
-        Returns:
-            list: The retransmitted segment.
-        """
-        payload, fin = self._segment_at_una()
-        seq = self.snd_una
-        self.fast_retransmits += 1
-        self._cancel_rtt_timing()
-        segment = self._emit(seq, payload, fin, 'fast', True)
-        self.snd_max = max(self.snd_max, seq + (1 if fin else len(payload)))
-        self.on_event('FAST_RETRANSMIT', seq=seq, len=len(payload))
-        return [segment]
-
-    # ------------------------------------------------------------------
-    # Flow control
-    # ------------------------------------------------------------------
-
-    def _update_rwnd(self, window):
-        """
-        Take the receiver's advertised window (slide 3-94).
-
-        When the window opens after being 0, probing stops and the probe
-        interval starts again from ``persist_min``.
-
-        Args:
-            window: Window field of the received segment in bytes.
+             window  window field of the received segment in bytes
         """
         old = self.rwnd
         self.rwnd = window
         if old > 0 and window == 0:
-            self.on_event('RWND_ZERO', ack=self.snd_una)
+            self.log('RWND_ZERO', ack=self.send_base)
         elif old == 0 and window > 0:
-            self.persist_interval = self.persist_min
-            self.persist_deadline = None
-            self.on_event('RWND_OPEN', rwnd=window)
+            self.log('RWND_OPEN', rwnd=window)
 
-    def _probe_needed(self):
-        """
-        Tell whether the zero-window probe timer should run.
+    def check_probe_timer(self, now):
+        """Arms or stops the probe timer.
 
-        Returns:
-            bool: True when rwnd is 0, nothing is in flight and data waits.
-        """
-        return (self.rwnd == 0 and self.bytes_in_flight() == 0
-                and self.snd_nxt < self.data_end())
-
-    def _check_persist(self, now):
-        """
-        Arm or disarm the persist timer for zero-window probes.
-
-        With rwnd 0 and nothing in flight no ACK will come to tell us the
-        window opened, so a timer must ask. An armed timer keeps its deadline.
+        extra: a probe is needed while rwnd is 0, nothing is in flight and data
+        waits. Then no ACK will come to tell us the window opened.
 
         Args:
-            now: Current time in seconds.
+             now  current time in seconds
         """
-        if not self._probe_needed():
-            self.persist_deadline = None
-        elif self.persist_deadline is None:
-            self.persist_deadline = now + self.persist_interval
+        needed = (self.rwnd == 0 and self.in_flight() == 0
+                  and self.next_seq_num < self.data_end())
+        if not needed:
+            self.probe_deadline = None
+        elif self.probe_deadline is None:
+            self.probe_deadline = now + PROBE_INTERVAL
 
-    def _send_window_probe(self, now):
-        """
-        Send one byte at ``snd_nxt`` to ask for the window (slide 3-94).
+    def send_probe(self, now):
+        """Sends one byte at NextSeqNum to ask for the window.
 
-        The receiver answers with an ACK that carries its current window, so
-        a lost window update cannot stall us. The probe byte is not counted
-        in flight. The interval doubles up to ``persist_max`` (the persist
-        timer is background, not on the slides).
+        extra: with rwnd 0, one data byte every 0.5 s. If the receiver's window
+        update is lost, its answer to a probe still brings the new rwnd. The probe
+        byte is neither timed nor counted in flight.
 
         Args:
-            now: Current time in seconds.
+             now  current time in seconds
 
         Returns:
-            list: The probe segment, or [] when no probe is needed any more.
+             list with the probe SendSegment, or [] when no probe is needed
         """
-        if not self._probe_needed():
-            self.persist_deadline = None
+        self.probe_deadline = None
+        self.check_probe_timer(now)
+        if self.probe_deadline is None:
             return []
-        seq = self.snd_nxt
-        interval = self.persist_interval
-        self.probes += 1
-        segment = self._emit(seq, self._payload(seq, 1), False, 'probe', False)
-        self.probe_seq = seq
-        self.on_event('PROBE', seq=seq, interval=interval)
-        self.persist_interval = min(2 * self.persist_interval, self.persist_max)
-        self.persist_deadline = now + self.persist_interval
-        return [segment]
+        self.probe_seq = self.next_seq_num
+        self.log('PROBE', seq=self.probe_seq)
+        return [SendSegment(self.next_seq_num, self.payload(self.next_seq_num, 1), False,
+                            'probe')]
