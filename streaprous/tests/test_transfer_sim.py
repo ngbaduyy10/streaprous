@@ -226,8 +226,8 @@ class TimeoutScenarioTest(TransferTestCase):
     def test_premature_timeout_scenario(self):
         """Flaw 3, slide 3-86 right: both ACKs are late, Seq=92 is resent, ACK=120 covers both.
 
-        The one resend starts at SendBase = 92 and, as resend_oldest builds
-        it, runs up to NextSeqNum, so it carries both segments' 28 bytes.
+        The one resend is the segment that caused the timeout as it was first
+        sent: Seq=92 with 8 bytes, as slide 3-86 draws it. B already has it.
         """
         first, second = data_of(8, b"a"), data_of(20, b"b")
 
@@ -241,13 +241,13 @@ class TimeoutScenarioTest(TransferTestCase):
         self.assertEqual([packet.ack for _, packet, _ in ack_link.delayed], [100, 120])
         first_ack_arrives = ack_link.delayed[0][0] + 0.01 + 1.0
         timeouts = of_name(result.sender_events, 'TIMEOUT')
-        self.assertEqual([(e.details['seq'], e.details['len']) for e in timeouts], [(92, 28)])
+        self.assertEqual([(e.details['seq'], e.details['len']) for e in timeouts], [(92, 8)])
         self.assertEqual(timeouts[0].state['next_seq_num'], 120)
         self.assertEqual(timeouts[0].time, 1.0)
         self.assertLess(timeouts[0].time, first_ack_arrives)
         self.assertEqual(len(resends(result)), 1)
         copies = of_name(result.receiver_events, 'DUP_SEGMENT')
-        self.assertEqual([(e.details['seq'], e.details['len']) for e in copies], [(92, 28)])
+        self.assertEqual([(e.details['seq'], e.details['len']) for e in copies], [(92, 8)])
         acks = of_name(result.sender_events, 'ACK')
         self.assertEqual([e.details['ack'] for e in acks], [120])
         self.assertGreater(acks[0].time, timeouts[0].time)

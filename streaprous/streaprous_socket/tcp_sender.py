@@ -25,6 +25,8 @@ class TcpSender:
          rwnd            the window field of the latest acceptable ACK
          data            every byte the application gave us; byte i has seq #
                          initial_seq_num + i
+         segment_end     seq # of each unACKed segment's first byte -> seq # just
+                         after its last byte, so a resend repeats that segment
          fin_seq         seq # of our FIN, None until close
          timer_deadline  when the one timer expires, None when it is stopped
          rtt_timed_seq   the ACK number that ends the timed segment, None if none is timed
@@ -53,6 +55,7 @@ class TcpSender:
         self.next_seq_num = initial_seq_num
         self.rwnd = rwnd
         self.data = b""
+        self.segment_end = {}
         self.fin_seq = None
         self.timer_deadline = None
         self.rtt_timed_seq = None
@@ -61,9 +64,7 @@ class TcpSender:
         self.probe_deadline = None
 
     def send_data(self, data, now):
-        """Event: data received from application (slide 3-84).
-
-        The bytes join the end of the byte stream, then go out as allowed.
+        """Event: data received from application (slide 3-84); the bytes join the stream.
 
         Args:
              data  bytes from the application
@@ -76,9 +77,10 @@ class TcpSender:
         return self.send_allowed(now)
 
     def close(self, now):
-        """Asks for our FIN after the last data byte (slide 3-103).
+        """Asks for our FIN after the last data byte (slides 3-103, 3-104).
 
-        "send TCP segment with FIN bit = 1": the FIN takes one seq #, goes out
+        slide 3-103: "send TCP segment with FIN bit = 1". The FIN takes one seq #
+        (slide 3-104: "FINbit=1, seq=x" is answered with "ACKnum=x+1"), goes out
         after the data, and the timer resends it until it is ACKed.
 
         Args:
@@ -95,7 +97,8 @@ class TcpSender:
         """Event: ACK received, with ACK field value ack (slides 3-84, 3-146).
 
         An ACK above SendBase is a new ACK. An ACK below SendBase is old: slide 3-146
-        acts only when y > SendBase.
+        acts only when y > SendBase. An ACK may also cover our probe byte
+        (probe_seq + 1), which NextSeqNum does not count.
 
         extra: an ACK for bytes we never sent is ignored; it cannot be a real ACK.
         extra: an ACK equal to SendBase is a duplicate ACK only while data is in
@@ -117,8 +120,8 @@ class TcpSender:
         if ack < self.send_base or ack > highest:
             return []
         if ack > self.send_base:
-            self.update_rwnd(window)
             self.on_new_ack(ack, now)
+            self.update_rwnd(window)
             return self.send_allowed(now)
         duplicate = self.in_flight() > 0 and not carries_data and window == self.rwnd
         self.update_rwnd(window)
@@ -203,7 +206,6 @@ class TcpSender:
 
         slide 3-84: seq # is byte-stream number of first data byte in segment, and
         start timer if not already running.
-
         extra: one segment is timed at a time; it gives the next SampleRTT.
 
         Args:
@@ -218,13 +220,14 @@ class TcpSender:
             self.rtt_timed_seq = seq + length
             self.rtt_sent_at = now
         self.next_seq_num = self.next_seq_num + length
+        self.segment_end[seq] = seq + length
         if self.timer_deadline is None:
             self.start_timer(now)
         self.log('SEND', seq=seq, len=length)
         return SendSegment(seq, self.payload(seq, length), False, 'new')
 
     def new_fin(self, now):
-        """Creates our FIN segment; it takes one seq # (slide 3-103).
+        """Creates our FIN segment; it takes one seq # (slide 3-104).
 
         Args:
              now  current time in seconds
@@ -243,15 +246,21 @@ class TcpSender:
         """ACK acknowledges previously unACKed segments (slides 3-84, 3-87, 3-146).
 
         Update what is known to be ACKed: SendBase = ack. The ACK is cumulative
-        (slide 3-87), so it covers an earlier lost ACK. Then start timer if there are
-        still unACKed segments, else stop it.
+        (slide 3-87), so it covers an earlier lost ACK. Segments the ACK covers leave
+        segment_end; when it ends inside a segment, the rest stays under the key ack.
+        Then start timer if there are still unACKed segments, else stop it.
 
         Args:
              ack  ACK number, above SendBase
              now  current time in seconds
         """
+        for seq in list(self.segment_end):
+            if seq < ack:
+                end = self.segment_end.pop(seq)
+                if end > ack:
+                    self.segment_end[ack] = end
         self.send_base = ack
-        self.next_seq_num = max(self.next_seq_num, ack)     # an ACKed probe byte
+        self.next_seq_num = max(self.next_seq_num, ack)  # may cover our probe byte (probe_seq + 1)
         self.probe_seq = None
         self.take_rtt_sample(ack, now)
         self.reno.on_new_ack()
@@ -317,11 +326,12 @@ class TcpSender:
         return [segment]
 
     def resend_oldest(self, kind):
-        """Builds the unACKed segment with the smallest seq # again (slides 3-84, 3-88).
+        """Builds the unACKed segment with the smallest seq # again (slides 3-84, 3-86, 3-88).
 
-        It cancels the RTT timing (slide 3-81: ignore retransmissions). The segment
-        is our FIN when only the FIN is unACKed, else up to one MSS of data that
-        never reaches past NextSeqNum.
+        slide 3-84: retransmit segment that caused timeout, as it was first sent
+        (slide 3-86: "Seq=92, 8 bytes of data"); it ends at segment_end, else at
+        NextSeqNum. It cancels the RTT timing (slide 3-81: ignore retransmissions).
+        With only the FIN unACKed, it is the FIN.
 
         Args:
              kind  'timeout' or 'fast'
@@ -332,7 +342,7 @@ class TcpSender:
         self.rtt_timed_seq = None
         if self.fin_seq is not None and self.send_base == self.fin_seq:
             return SendSegment(self.send_base, b"", True, kind)
-        end = min(self.next_seq_num, self.data_end())
+        end = self.segment_end.get(self.send_base, min(self.next_seq_num, self.data_end()))
         length = min(self.mss, end - self.send_base)
         return SendSegment(self.send_base, self.payload(self.send_base, length), False, kind)
 
@@ -411,7 +421,7 @@ class TcpSender:
              list with the probe SendSegment, or [] when no probe is needed
         """
         self.probe_deadline = None
-        self.check_probe_timer(now)
+        self.check_probe_timer(now)    # re-arms the next probe; None means none is needed
         if self.probe_deadline is None:
             return []
         self.probe_seq = self.next_seq_num

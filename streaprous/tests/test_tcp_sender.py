@@ -269,6 +269,24 @@ class TimeoutTest(unittest.TestCase):
         out = sender.on_tick(2.1)
         self.assertEqual(out, [SendSegment(ISN + 100, data[100:200], False, 'timeout')])
 
+    def test_timeout_resends_the_original_segment(self):
+        """Slides 3-84, 3-86: retransmit segment that caused timeout, as it was first sent."""
+        sender, _ = make(cwnd=4 * MSS)
+        first, second = data_of(8), data_of(20)
+        sender.send_data(first, 0.0)
+        sender.send_data(second, 0.2)
+        self.assertEqual(sender.next_seq_num, ISN + 28)
+        self.assertEqual(sender.on_tick(1.0), [SendSegment(ISN, first, False, 'timeout')])
+
+    def test_partial_ack_resends_rest_of_segment(self):
+        """Slide 3-84: an ACK inside a segment; the timeout resends the rest of that segment."""
+        sender, _ = make(cwnd=4 * MSS)
+        data = data_of(200)
+        sender.send_data(data, 0.0)
+        self.assertEqual(sender.on_ack(ISN + 40, BIG, False, 0.1), [])
+        out = sender.on_tick(sender.timer_deadline)
+        self.assertEqual(out, [SendSegment(ISN + 40, data[40:100], False, 'timeout')])
+
     def test_timeout_resends_only_one_segment(self):
         """Slide 3-84 and flaw scenario 5: one segment per timeout; NextSeqNum never moves back."""
         sender, events = make(cwnd=4 * MSS)
@@ -360,6 +378,18 @@ class DuplicateAckTest(unittest.TestCase):
         self.assertEqual(sender.on_ack(ISN, BIG, False, 0.1), [])
         self.assertEqual([d['count'] for d in details(events, 'DUPACK')], [1, 2, 3, 3])
         self.assertEqual(details(events, 'FAST_RETRANSMIT'), [{'seq': ISN, 'len': 100}])
+
+    def test_fast_retransmit_resends_one_original_segment(self):
+        """Slide 3-88: resend unACKed segment with smallest seq #, exactly as it was sent."""
+        sender, events = make(cwnd=5 * MSS)
+        data = data_of(150)
+        for start in range(0, 150, 30):
+            sender.send_data(data[start:start + 30], 0.0)
+        self.assertEqual(names(events).count('SEND'), 5)
+        out = []
+        for _ in range(3):
+            out.extend(sender.on_ack(ISN, BIG, False, 0.1))
+        self.assertEqual(out, [SendSegment(ISN, data[:30], False, 'fast')])
 
     def test_ack_with_data_is_not_duplicate(self):
         """Extra and flaw scenario: an ACK that carries data is not a duplicate ACK."""
@@ -562,13 +592,20 @@ class ZeroWindowTest(unittest.TestCase):
     def test_zero_window_arms_probe(self):
         """Extra: rwnd 0 with nothing in flight arms the probe 0.5 s later."""
         sender, events, data = zero_after_first()
-        self.assertEqual(details(events, 'RWND_ZERO'), [{'ack': ISN}])
+        self.assertEqual(details(events, 'RWND_ZERO'), [{'ack': ISN + 100}])
         self.assertIsNone(sender.timer_deadline)
         self.assertAlmostEqual(sender.probe_deadline, 0.1 + PROBE_INTERVAL)
         self.assertEqual(sender.on_tick(0.59), [])
         out = sender.on_tick(0.6)
         self.assertEqual(out, [SendSegment(ISN + 100, data[100:101], False, 'probe')])
         self.assertEqual(details(events, 'PROBE'), [{'seq': ISN + 100}])
+
+    def test_rwnd_zero_logged_with_new_ack(self):
+        """Slide 3-94: RWND_ZERO names the new ACK and shows nothing in flight."""
+        sender, events, _ = zero_after_first()
+        rows = [(e[1], e[2]) for e in events if e[0] == 'RWND_ZERO']
+        self.assertEqual(rows, [({'ack': ISN + 100}, 0)])
+        self.assertEqual(names(events)[-2:], ['ACK', 'RWND_ZERO'])
 
     def test_probe_interval_is_fixed(self):
         """Extra: one data byte every 0.5 s; the interval never doubles."""
