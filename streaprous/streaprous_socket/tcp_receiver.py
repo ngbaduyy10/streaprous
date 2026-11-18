@@ -89,8 +89,10 @@ class TcpReceiver:
     def trim_to_window(self, seq, data, fin):
         """Cuts the bytes we already have and the bytes past the free space.
 
-        Slide 3-94: keeping only what fits in rwnd "guarantees receive buffer will
-        not overflow". When the end is cut, the FIN goes too; the client resends it.
+        Slide 3-94: the sender's limit to rwnd "guarantees receive buffer will not
+        overflow"; we also cut anything a sender puts past rwnd, so the guarantee
+        holds even if it does not. When the end is cut, the FIN goes too; the client
+        resends it.
 
         Args:
              seq   seq # of the first data byte
@@ -226,7 +228,8 @@ class TcpReceiver:
         to at least a quarter. The window only travels in segments we send (slide
         3-94), so after a zero or small window nothing else would tell the sender.
         """
-        return self.last_rwnd < self.rcv_buffer // 4 <= self.rwnd()
+        quarter = self.rcv_buffer // 4
+        return self.last_rwnd < quarter and quarter <= self.rwnd()
 
     def ack_sent(self, rwnd):
         """Notes that a segment with ACK = ``expected_seq_num`` went out.

@@ -35,10 +35,11 @@ class RttEstimator:
         self.timeout_interval = first_timeout_interval
 
     def add_sample(self, sample_rtt):
-        """Takes one SampleRTT and updates the estimates in the slides' order.
+        """Takes one SampleRTT and updates the estimates.
 
-        A later sample runs slide 3-82 (EstimatedRTT) first, then slide 3-83
-        (DevRTT, with the new EstimatedRTT), then TimeoutInterval.
+        The slides do not fix the order; we follow their page order. A later sample
+        runs slide 3-82 (EstimatedRTT) first, then slide 3-83 (DevRTT), then
+        TimeoutInterval.
 
         extra: the first SampleRTT starts both averages: EstimatedRTT = SampleRTT
         and DevRTT = SampleRTT/2, because each EWMA needs an old value.
@@ -68,7 +69,9 @@ class RttEstimator:
         """Moves DevRTT towards the new deviation (slide 3-83).
 
         DevRTT = (1 - beta)*DevRTT + beta*|SampleRTT - EstimatedRTT|, beta = 0.25.
-        EstimatedRTT here is the new one, already updated by slide 3-82.
+        The slides do not say whether this uses the old or the new EstimatedRTT; we
+        use the new one, already updated by slide 3-82 (RFC 6298 uses the old one,
+        background).
 
         Args:
              sample_rtt  measured round trip time in seconds
@@ -81,8 +84,9 @@ class RttEstimator:
 
         TimeoutInterval = EstimatedRTT + 4*DevRTT: the estimate plus a safety margin.
 
-        extra: never below 0.2 s. A receiver may wait up to 500 ms before it ACKs
-        (slide 3-85), so a shorter timer resends segments that were not lost.
+        extra: never below 0.2 s. Linux clients delay an ACK at most 200 ms and our
+        receiver 100 ms (Linux, background), and that delay already feeds SampleRTT,
+        so a shorter timer would resend segments that were not lost.
         """
         timeout = self.estimated_rtt + 4 * self.dev_rtt
         self.timeout_interval = max(self.min_timeout_interval, timeout)

@@ -94,8 +94,14 @@ def unwrap(value, near):
     keeps growing; only the wire copy is cut to 32 bits. This picks the
     integer equal to value modulo 2^32 that is closest to near.
 
+    Example: near = 2^32 - 10 and value = 5. diff = (5 - near) % 2^32 = 15, which
+    is below 2^31, so the result is near + 15 = 2^32 + 5.
+
     Args:
          value  32-bit number read from a header
          near   unbounded number it should be close to
     """
-    return near + ((value - near + SEQ_MOD // 2) % SEQ_MOD) - SEQ_MOD // 2
+    diff = (value - near) % SEQ_MOD
+    if diff >= SEQ_MOD // 2:
+        diff -= SEQ_MOD
+    return near + diff

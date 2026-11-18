@@ -205,7 +205,9 @@ class TcpConnection:
             self.put_on_wire(segment.seq, segment.payload, segment.fin)
 
     def send_ack(self, reason):
-        """Sends a pure ACK with seq # NextSeqNum for the next byte we expect (slide 3-85).
+        """Sends a pure ACK with seq # NextSeqNum for the next byte we expect.
+
+        Slide 3-85 says when to ACK; for the seq # see slide 3-80: Seq=43, ACK=80.
 
         Args:
              reason  why the ACK goes out, such as 'delayed', 'duplicate' or 'window_update'
