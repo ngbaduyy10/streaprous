@@ -124,6 +124,19 @@ class ResultLineTest(unittest.TestCase):
                          {'method': 'POST', 'sent_bytes': '10', 'handshake': 'ok'})
 
 
+class ConnectCloseParserTest(unittest.TestCase):
+    """The connect-close command line."""
+
+    def test_host_and_port_only(self):
+        args = client.build_parser().parse_args(['connect-close', '172.28.0.10', '9000'])
+        self.assertEqual((args.host, args.port), ('172.28.0.10', 9000))
+
+    def test_fin_check_flag_is_gone(self):
+        with self.assertRaises(SystemExit):
+            client.build_parser().parse_args(
+                ['connect-close', '172.28.0.10', '9000', '--no-fin-check'])
+
+
 class DemoContentTest(unittest.TestCase):
     """make_files.demo_content."""
 

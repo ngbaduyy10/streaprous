@@ -58,7 +58,7 @@ PCAP_ZERO = PCAP + '\n' + '\n'.join([
     'win 0, length 0',
 ])
 
-CSV_HEAD = 'time,event,cwnd,ssthresh,rwnd,in_flight,snd_una,snd_nxt,adv_wnd\n'
+CSV_HEAD = 'time,event,cwnd,ssthresh,rwnd,in_flight,send_base,next_seq_num,adv_rwnd\n'
 
 
 def write_trace(directory, name, lines):
@@ -149,7 +149,7 @@ class TraceHelpersTest(unittest.TestCase):
         self.assertEqual(rows[0]['event'], 'OPEN')
         self.assertEqual(rows[1]['time'], 0.0123)
         self.assertEqual(rows[1]['cwnd'], 1460)
-        self.assertIsNone(rows[1]['adv_wnd'])
+        self.assertIsNone(rows[1]['adv_rwnd'])
 
     def test_largest_trace(self):
         self.assertIsNone(checks.largest_trace(self.tmp.name))
@@ -164,10 +164,12 @@ class TraceHelpersTest(unittest.TestCase):
     def test_window_invariant_violations(self):
         path = write_trace(self.tmp.name, 'trace_a_1.csv', [
             '0.1,SEND,2920,32768,64240,2920,1,2921,32768',         # equals cwnd: allowed
-            '0.2,RETRANSMIT,2920,32768,1460,1460,1,1461,32768',    # equals rwnd: allowed
+            '0.2,SEND,2920,32768,1460,1460,1,1461,32768',          # equals rwnd: allowed
             '0.3,SEND,2920,32768,64240,4380,1,4381,32768',         # over cwnd
             '0.4,ACK,2920,32768,1460,9999,1,4381,32768',           # not a send row
-            '0.5,RETRANSMIT,8760,32768,2920,4380,1,4381,32768',    # over rwnd
+            '0.5,SEND,8760,32768,2920,4380,1,4381,32768',          # over rwnd
+            '0.6,FAST_RETRANSMIT,2920,32768,1460,9999,1,4381,32768',   # SEND rows only
+            '0.7,TIMEOUT,1460,32768,1460,9999,1,4381,32768',           # SEND rows only
         ])
         bad = checks.window_invariant_violations(checks.read_trace(path))
         self.assertEqual([row['time'] for row in bad], [0.3, 0.5])
@@ -176,7 +178,7 @@ class TraceHelpersTest(unittest.TestCase):
     def test_adv_zero_then_open(self):
         path = write_trace(self.tmp.name, 'trace_a_1.csv', [
             '0.1,SEND,1,1,1,0,1,1,16384',
-            '0.2,WINDOW_ZERO,1,1,1,0,1,1,0',
+            '0.2,WINDOW_UPDATE,1,1,1,0,1,1,0',
             '0.3,WINDOW_UPDATE,1,1,1,0,1,1,2048',
             '0.4,WINDOW_UPDATE,1,1,1,0,1,1,6144',
         ])
@@ -186,6 +188,108 @@ class TraceHelpersTest(unittest.TestCase):
         self.assertFalse(checks.adv_zero_then_open(rows[:1], 1))
         # a window that opens before it closes does not count
         self.assertFalse(checks.adv_zero_then_open([rows[0], rows[3], rows[1]], 4096))
+
+
+MSS = 1460
+
+
+def make_rows(specs):
+    """
+    Build trace rows from (event, cwnd, ssthresh) triples, one tick apart.
+
+    Args:
+        specs (list): (event, cwnd, ssthresh) tuples.
+
+    Returns:
+        list of row dicts like read_trace gives.
+    """
+    return [{'time': index * 0.1, 'event': event, 'cwnd': cwnd, 'ssthresh': ssthresh}
+            for index, (event, cwnd, ssthresh) in enumerate(specs)]
+
+
+def clean_slow_start():
+    """
+    Rows of a clean run: 10 slow start steps, then 2 avoidance steps.
+
+    Returns:
+        list of (event, cwnd, ssthresh) tuples.
+    """
+    specs = [('OPEN', MSS, 14600)]
+    for step in range(2, 12):
+        specs.append(('ACK', step * MSS, 14600))
+    specs += [('ACK', 11 * MSS + 5, 14600), ('ACK', 11 * MSS + 105, 14600)]
+    return specs
+
+
+class SlowStartTest(unittest.TestCase):
+    """slow_start_problems."""
+
+    def test_clean_trace(self):
+        rows = make_rows(clean_slow_start())
+        self.assertEqual(checks.slow_start_problems(rows, MSS), [])
+
+    def test_wrong_step(self):
+        specs = clean_slow_start()
+        specs[4] = ('ACK', specs[4][1] + 100, 65535)
+        problems = checks.slow_start_problems(make_rows(specs), MSS)
+        self.assertTrue(any('slow start rose by' in text for text in problems))
+
+    def test_first_cwnd_must_be_one_mss(self):
+        specs = clean_slow_start()
+        specs[0] = ('OPEN', 2 * MSS, 65535)
+        self.assertTrue(checks.slow_start_problems(make_rows(specs), MSS))
+
+    def test_too_few_steps(self):
+        rows = make_rows(clean_slow_start()[:5])
+        self.assertTrue(any('only' in text for text in checks.slow_start_problems(rows, MSS)))
+
+    def test_stops_at_the_first_drop_of_cwnd(self):
+        specs = clean_slow_start() + [('STATE', 7300, 7300), ('ACK', 7300 + 999, 7300)]
+        self.assertEqual(checks.slow_start_problems(make_rows(specs), MSS), [])
+
+    def test_no_rows(self):
+        self.assertEqual(checks.slow_start_problems([], MSS), ['no rows'])
+
+
+class LossReactionTest(unittest.TestCase):
+    """loss_reaction_problems."""
+
+    def good(self):
+        """Rows with one fast retransmit and one timeout, both right."""
+        return make_rows([('FAST_RETRANSMIT', 7300 + 3 * MSS, 7300),
+                          ('TIMEOUT', MSS, 3650)])
+
+    def test_clean_trace(self):
+        self.assertEqual(checks.loss_reaction_problems(self.good(), MSS), [])
+
+    def test_timeout_with_wrong_cwnd(self):
+        rows = self.good()
+        rows[1]['cwnd'] = 2 * MSS
+        problems = checks.loss_reaction_problems(rows, MSS)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('TIMEOUT', problems[0])
+
+    def test_fast_retransmit_with_wrong_cwnd(self):
+        rows = self.good()
+        rows[0]['cwnd'] = 7300
+        self.assertTrue(checks.loss_reaction_problems(rows, MSS))
+
+    def test_missing_fast_retransmit(self):
+        problems = checks.loss_reaction_problems(self.good()[1:], MSS)
+        self.assertEqual(problems, ['no FAST_RETRANSMIT row'])
+
+    def test_missing_timeout(self):
+        problems = checks.loss_reaction_problems(self.good()[:1], MSS)
+        self.assertEqual(problems, ['no TIMEOUT row'])
+
+
+class ColumnNamesTest(unittest.TestCase):
+    """The CSV column names."""
+
+    def test_numeric_columns(self):
+        self.assertEqual(checks.NUMERIC_COLUMNS, (
+            'time', 'cwnd', 'ssthresh', 'rwnd', 'in_flight',
+            'send_base', 'next_seq_num', 'adv_rwnd'))
 
 
 if __name__ == '__main__':

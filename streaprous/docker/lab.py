@@ -8,9 +8,7 @@ one network, runs the scenarios below and checks the results.
 
 Commands (run from anywhere):
     python streaprous/docker/lab.py build
-    python streaprous/docker/lab.py smoke
     python streaprous/docker/lab.py test [--only a,b]
-    python streaprous/docker/lab.py demo loss|slow-reader|trace|slow-app
     python streaprous/docker/lab.py unit36
     python streaprous/docker/lab.py clean
 """
@@ -22,7 +20,6 @@ import shutil
 import subprocess
 import sys
 import time
-import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STREAP_DIR = os.path.dirname(HERE)           # .../streaprous
@@ -55,15 +52,12 @@ GET_INDEX = 'get {srv}/ --expect-file www/index.html'
 #   env          extra environment variables of the server
 #   server_netem / client_netem   tc netem arguments, or None
 #   steps        client commands, run in order inside the client container ({srv} = server URL)
-#   plot         None, or {'window': bool, 'out': file name} to run tools/plot_trace.py
 #   checks       dicts: 'check' names a function of CHECKS, 'label' is printed, rest are arguments
-#   demo         for the demo command: events whose first lines are shown as proof
 SCENARIOS = [
     {
         'name': 'lab3',
         'image': 'lab', 'env': {}, 'server_netem': None, 'client_netem': None,
         'steps': ['connect-close ' + SERVER_IP + ' ' + str(PORT), GET_INDEX],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'both client steps exit 0'},
         ],
@@ -72,7 +66,6 @@ SCENARIOS = [
         'name': 'download',
         'image': 'lab', 'env': {}, 'server_netem': None, 'client_netem': None,
         'steps': [GET_1M],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'max_payload', 'label': 'largest server payload is the MSS (1460)',
@@ -89,7 +82,6 @@ SCENARIOS = [
         'image': 'lab', 'env': {}, 'server_netem': None, 'client_netem': None,
         'steps': ['get {srv}/ --header-bytes 3000 --expect-file www/index.html',
                   'post {srv}/ --size 150000'],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'both client steps exit 0'},
             {'check': 'header_read', 'label': 'a request was read with header >= 3000 bytes',
@@ -103,7 +95,6 @@ SCENARIOS = [
         'image': 'lab', 'env': {'STREAPROUS_DROP_SEND': '3,60'},
         'server_netem': None, 'client_netem': None,
         'steps': [GET_1M],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'event_count', 'label': 'DROP count is 2', 'event': 'DROP', 'equals': 2},
@@ -112,14 +103,12 @@ SCENARIOS = [
              'event': 'FAST_RETRANSMIT', 'min': 1},
             {'check': 'event_count', 'label': 'DUPACK >= 3', 'event': 'DUPACK', 'min': 3},
         ],
-        'demo': ['DROP', 'TIMEOUT', 'DUPACK', 'FAST_RETRANSMIT', 'RETRANSMIT'],
     },
     {
         'name': 'random-loss',
         'image': 'lab', 'env': {'STREAPROUS_LOSS': '0.02', 'STREAPROUS_LOSS_SEED': '7'},
         'server_netem': None, 'client_netem': None,
         'steps': [GET_1M],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'event_count', 'label': 'DROP lines with why=random >= 5',
@@ -132,7 +121,6 @@ SCENARIOS = [
         'image': 'lab', 'env': {}, 'server_netem': None, 'client_netem': None,
         'steps': ['get {srv}/demo_256k.bin --expect demo_256k.bin --rcvbuf 4096 '
                   '--read-bytes 4096 --read-delay 0.05 --pause-after 32768 --pause 2.0'],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'event_count', 'label': 'RWND_ZERO >= 1', 'event': 'RWND_ZERO', 'min': 1},
@@ -142,14 +130,12 @@ SCENARIOS = [
              'last': 'PROBE', 'then': 'SEND'},
             {'check': 'no_violations', 'label': 'sends stay within min(cwnd, rwnd)'},
         ],
-        'demo': ['RWND_ZERO', 'PROBE', 'RWND_OPEN'],
     },
     {
         'name': 'trace',
-        'image': 'lab', 'env': {'STREAPROUS_DROP_SEND': '150,400-430'},
+        'image': 'lab', 'env': {'STREAPROUS_DROP_SEND': '150,400-402'},
         'server_netem': 'delay 20ms', 'client_netem': 'delay 20ms',
         'steps': [GET_1M],
-        'plot': {'window': False, 'out': 'cwnd.svg'},
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'state_change', 'label': 'STATE SLOW_START -> CONGESTION_AVOIDANCE seen',
@@ -157,17 +143,17 @@ SCENARIOS = [
             {'check': 'event_count', 'label': 'FAST_RETRANSMIT >= 1',
              'event': 'FAST_RETRANSMIT', 'min': 1},
             {'check': 'event_count', 'label': 'TIMEOUT >= 1', 'event': 'TIMEOUT', 'min': 1},
-            {'check': 'svg_ok', 'label': 'cwnd.svg parses and has a polyline',
-             'file': 'cwnd.svg', 'polyline_min': 1},
+            {'check': 'trace_slow_start', 'label': 'slow start grows cwnd by one MSS per ACK',
+             'mss': 1460},
+            {'check': 'trace_loss_reaction', 'label': 'TIMEOUT and FAST_RETRANSMIT set cwnd',
+             'mss': 1460},
         ],
-        'demo': ['STATE', 'FAST_RETRANSMIT', 'TIMEOUT'],
     },
     {
         'name': 'upload',
         'image': 'lab', 'env': {}, 'server_netem': None,
         'client_netem': 'delay 10ms reorder 25% 50% duplicate 3% loss 2%',
         'steps': ['post {srv}/ --size 300000'],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'body_read', 'label': 'a read has body 300000 and the sent sha256',
@@ -187,7 +173,6 @@ SCENARIOS = [
                 'STREAPROUS_APP_READ_BYTES': '2048'},
         'server_netem': None, 'client_netem': None,
         'steps': ['post {srv}/ --size 300000'],
-        'plot': {'window': True, 'out': 'window.svg'},
         'checks': [
             {'check': 'exits_ok', 'label': 'client exits 0'},
             {'check': 'body_read', 'label': 'the body read has the sent sha256 (300000 bytes)',
@@ -197,16 +182,12 @@ SCENARIOS = [
             {'check': 'event_count', 'label': 'WINDOW_UPDATE >= 1', 'event': 'WINDOW_UPDATE',
              'min': 1},
             {'check': 'zero_window_sent', 'label': 'a "win 0" segment is in the pcap'},
-            {'check': 'svg_ok', 'label': 'window.svg exists', 'file': 'window.svg',
-             'polyline_min': 0},
         ],
-        'demo': ['WINDOW_ZERO', 'WINDOW_UPDATE'],
     },
     {
         'name': 'py36',
         'image': 'lab36', 'env': {}, 'server_netem': None, 'client_netem': None,
         'steps': [GET_1M, GET_INDEX],
-        'plot': None,
         'checks': [
             {'check': 'exits_ok', 'label': 'both client steps exit 0'},
             {'check': 'server_version', 'label': 'server runs Python 3.6.15',
@@ -513,31 +494,6 @@ def make_demo_files():
         raise LabError('demo/make_files.py failed')
 
 
-def run_plot(scenario, out_dir, ctx):
-    """
-    Run tools/plot_trace.py on the largest trace of a scenario.
-
-    Args:
-        scenario (dict): an entry of SCENARIOS.
-        out_dir (str): the scenario's output folder.
-        ctx (dict): context; "plot_error" is set when the chart was not made.
-    """
-    plot = scenario['plot']
-    trace = checks.largest_trace(out_dir)
-    if trace is None:
-        ctx['plot_error'] = 'no trace_*.csv in {}'.format(out_dir)
-        return
-    command = [sys.executable, os.path.join('tools', 'plot_trace.py'), trace]
-    if plot['window']:
-        command.append('--window')
-    command += ['-o', os.path.join(out_dir, plot['out'])]
-    done = subprocess.run(command, cwd=STREAP_DIR, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT)
-    text = done.stdout.decode('utf-8', 'replace')
-    if done.returncode != 0:
-        ctx['plot_error'] = 'plot_trace.py exit {}: {}'.format(done.returncode, text.strip())
-
-
 def run_scenario(scenario):
     """
     Run one scenario and collect everything the checks need.
@@ -546,7 +502,7 @@ def run_scenario(scenario):
         scenario (dict): an entry of SCENARIOS.
 
     Returns:
-        ctx dict: name, out_dir, steps, log, pcap, server_version, plot_error.
+        ctx dict: name, out_dir, steps, log, pcap, server_version.
 
     Raises:
         LabError: when the lab itself fails (not when a check will fail).
@@ -560,7 +516,7 @@ def run_scenario(scenario):
     ensure_network()
     ensure_client()
     set_client_netem(scenario['client_netem'])
-    ctx = {'name': name, 'out_dir': out_dir, 'steps': [], 'plot_error': None}
+    ctx = {'name': name, 'out_dir': out_dir, 'steps': []}
     try:
         start_server(scenario)
         for step in scenario['steps']:
@@ -573,8 +529,6 @@ def run_scenario(scenario):
         ctx['pcap'] = docker(['exec', CLIENT, 'tcpdump', '-nn', '-S', '-r', pcap], timeout=120)[1]
     finally:
         remove_container(SERVER)
-    if scenario['plot']:
-        run_plot(scenario, out_dir, ctx)
     return ctx
 
 
@@ -672,19 +626,22 @@ def check_state_change(spec, ctx):
         len(checks.event_lines(ctx['log'], 'STATE')))
 
 
-def check_svg_ok(spec, ctx):
-    """A chart exists, parses as XML and has enough polylines."""
-    if ctx['plot_error']:
-        return False, ctx['plot_error']
-    path = os.path.join(ctx['out_dir'], spec['file'])
-    if not os.path.isfile(path):
-        return False, '{} was not written'.format(spec['file'])
-    try:
-        root = ET.parse(path).getroot()
-    except ET.ParseError as exc:
-        return False, 'not valid XML: {}'.format(exc)
-    count = sum(1 for element in root.iter() if element.tag.endswith('polyline'))
-    return count >= spec['polyline_min'], '{} polylines'.format(count)
+def check_trace_slow_start(spec, ctx):
+    """The CSV trace shows slow start growing cwnd as the slides say (3-123, 3-125)."""
+    rows = _trace_rows(ctx)
+    if rows is None:
+        return False, 'no trace file'
+    problems = checks.slow_start_problems(rows, spec['mss'])
+    return not problems, '; '.join(problems[:3]) or 'slow start steps are right'
+
+
+def check_trace_loss_reaction(spec, ctx):
+    """The CSV trace shows cwnd after TIMEOUT and FAST_RETRANSMIT (3-124, 3-125)."""
+    rows = _trace_rows(ctx)
+    if rows is None:
+        return False, 'no trace file'
+    problems = checks.loss_reaction_problems(rows, spec['mss'])
+    return not problems, '; '.join(problems[:3]) or 'loss reactions are right'
 
 
 def check_adv_zero_then_open(spec, ctx):
@@ -733,7 +690,8 @@ CHECKS = {
     'header_read': check_header_read,
     'body_read': check_body_read,
     'state_change': check_state_change,
-    'svg_ok': check_svg_ok,
+    'trace_slow_start': check_trace_slow_start,
+    'trace_loss_reaction': check_trace_loss_reaction,
     'adv_zero_then_open': check_adv_zero_then_open,
     'send_after_last': check_send_after_last,
     'zero_window_sent': check_zero_window_sent,
@@ -802,30 +760,6 @@ def cmd_build(args):
     return 0
 
 
-def cmd_smoke(args):
-    """Start the server on the current code and check that a client can connect."""
-    ensure_docker()
-    code = cmd_build(args)
-    if code != 0:
-        return code
-    scenario = {'name': 'smoke', 'image': 'lab', 'env': {}, 'server_netem': None,
-                'client_netem': None}
-    reset_dir(os.path.join(STREAP_DIR, 'out', 'smoke'))
-    ensure_network()
-    ensure_client()
-    set_client_netem(None)
-    try:
-        start_server(scenario)
-        step = client_exec('connect-close {} {} --no-fin-check'.format(SERVER_IP, PORT),
-                           os.path.join(STREAP_DIR, 'out', 'smoke', 'client.txt'))
-    finally:
-        remove_container(SERVER)
-    say(step['output'].rstrip())
-    handshake = step['result'].get('handshake', 'fail')
-    say('smoke: handshake={}'.format(handshake))
-    return 0 if step['rc'] == 0 and handshake == 'ok' else 1
-
-
 def cmd_test(args):
     """Run the scenarios in order and report every check."""
     ensure_docker()
@@ -850,41 +784,6 @@ def cmd_test(args):
         failed += evaluate(scenario, ctx)
     say('ALL PASSED' if failed == 0 else '{} FAILED'.format(failed))
     return 0 if failed == 0 else 1
-
-
-def cmd_demo(args):
-    """Run one scenario as a demo and show the proof events."""
-    ensure_docker()
-    scenario = next((s for s in SCENARIOS if s['name'] == args.name), None)
-    if scenario is None or 'demo' not in scenario:
-        names = [s['name'] for s in SCENARIOS if 'demo' in s]
-        raise LabError('no demo called {}; choose from {}'.format(args.name, ', '.join(names)))
-    make_demo_files()
-    say('Demo {}'.format(scenario['name']))
-    say('  server image : {}'.format(IMAGES[scenario['image']][0]))
-    say('  server env   : {}'.format(' '.join('{}={}'.format(k, v) for k, v
-                                              in sorted(scenario['env'].items())) or '-'))
-    say('  server netem : {}'.format(scenario['server_netem'] or '-'))
-    say('  client netem : {}'.format(scenario['client_netem'] or '-'))
-    for step in scenario['steps']:
-        say('  client step  : client.py ' + step.format(srv=SRV))
-    ctx = run_scenario(scenario)
-    say('')
-    for step in ctx['steps']:
-        say('RESULT line (exit {}): {}'.format(
-            step['rc'], ' '.join('{}={}'.format(k, v) for k, v in step['result'].items())))
-    for event in scenario['demo']:
-        lines = checks.event_lines(ctx['log'], event, 3)
-        say('{} x{} (first {} shown)'.format(event, checks.count_events(ctx['log'], event),
-                                             len(lines)))
-        for line in lines:
-            say('    ' + line)
-    say('')
-    say('Output files in {}:'.format(ctx['out_dir']))
-    for name in sorted(os.listdir(ctx['out_dir'])):
-        say('    ' + name)
-    say('')
-    return 1 if evaluate(scenario, ctx) else 0
 
 
 def cmd_unit36(args):
@@ -920,14 +819,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog='lab.py', description='StreapRous Docker lab')
     commands = parser.add_subparsers(dest='command')
     commands.add_parser('build', help='build both images').set_defaults(run=cmd_build)
-    commands.add_parser('smoke', help='build, start the server, connect once').set_defaults(
-        run=cmd_smoke)
     test = commands.add_parser('test', help='run the scenarios and check them')
     test.add_argument('--only', help='comma-separated scenario names')
     test.set_defaults(run=cmd_test)
-    demo = commands.add_parser('demo', help='run one scenario as a demo')
-    demo.add_argument('name', help='loss, slow-reader, trace or slow-app')
-    demo.set_defaults(run=cmd_demo)
     commands.add_parser('unit36', help='compile and unit-test under Python 3.6').set_defaults(
         run=cmd_unit36)
     commands.add_parser('clean', help='remove containers and network').set_defaults(

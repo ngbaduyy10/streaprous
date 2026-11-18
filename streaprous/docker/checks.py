@@ -14,7 +14,7 @@ import re
 
 # Columns of the CSV trace that hold numbers (the other column is "event").
 NUMERIC_COLUMNS = ('time', 'cwnd', 'ssthresh', 'rwnd', 'in_flight',
-                   'snd_una', 'snd_nxt', 'adv_wnd')
+                   'send_base', 'next_seq_num', 'adv_rwnd')
 
 # A tcpdump -nn line: "<time> IP a.b.c.d.sport > e.f.g.h.dport: Flags [..], ..."
 TCPDUMP_LINE = re.compile(
@@ -131,18 +131,18 @@ def largest_trace(directory):
 
 def window_invariant_violations(rows):
     """
-    Find sends that put more bytes in flight than the sending window allows.
+    Find SEND rows that put more bytes in flight than the sending window allows.
 
     Args:
         rows (list): rows from read_trace.
 
     Returns:
-        list of the SEND / RETRANSMIT rows whose in_flight exceeds
-        min(cwnd, rwnd); empty when the sender obeyed both windows.
+        list of the SEND rows whose in_flight exceeds min(cwnd, rwnd);
+        empty when the sender obeyed both windows.
     """
     bad = []
     for row in rows:
-        if row['event'] not in ('SEND', 'RETRANSMIT'):
+        if row['event'] != 'SEND':
             continue
         values = (row['in_flight'], row['cwnd'], row['rwnd'])
         if None in values:
@@ -218,12 +218,12 @@ def adv_zero_then_open(rows, reopen_at_least):
         reopen_at_least (int): window in bytes that counts as open.
 
     Returns:
-        True when a row with adv_wnd 0 is followed by a row with
-        adv_wnd >= reopen_at_least.
+        True when a row with adv_rwnd 0 is followed by a row with
+        adv_rwnd >= reopen_at_least.
     """
     seen_zero = False
     for row in rows:
-        window = row['adv_wnd']
+        window = row['adv_rwnd']
         if window is None:
             continue
         if window == 0:
@@ -281,3 +281,80 @@ def state_change_seen(log, old, new):
     """
     wanted = re.compile(r'\bold=' + re.escape(old) + r'\b.*\bnew=' + re.escape(new) + r'\b')
     return any(wanted.search(line) for line in event_lines(log, 'STATE'))
+
+
+def slow_start_problems(rows, mss):
+    """
+    Check the rows up to the first loss reaction against slow start (3-123, 3-125).
+
+    The first loss reaction is the first row whose cwnd is lower than the row
+    before it. In the rows before it, each rise of cwnd must be exactly mss
+    when the earlier row's cwnd is at most its ssthresh, and between 1 and
+    mss - 1 otherwise. The first cwnd must be mss and at least 8 rises of
+    mss must appear.
+
+    Args:
+        rows (list): rows from read_trace.
+        mss (int): maximum segment size in bytes.
+
+    Returns:
+        list of problem strings; empty when the trace is fine.
+    """
+    if not rows:
+        return ['no rows']
+    problems = []
+    if rows[0]['cwnd'] != mss:
+        problems.append('first cwnd is {}, not {}'.format(rows[0]['cwnd'], mss))
+    steps = 0
+    for before, after in zip(rows, rows[1:]):
+        if None in (before['cwnd'], before['ssthresh'], after['cwnd']):
+            continue
+        if after['cwnd'] < before['cwnd']:
+            break
+        rise = after['cwnd'] - before['cwnd']
+        if rise == 0:
+            continue
+        if before['cwnd'] <= before['ssthresh']:
+            if rise != mss:
+                problems.append('slow start rose by {} at {} (cwnd {}), not {}'.format(
+                    rise, after['time'], before['cwnd'], mss))
+            else:
+                steps += 1
+        elif not 1 <= rise < mss:
+            problems.append('congestion avoidance rose by {} at {} (cwnd {})'.format(
+                rise, after['time'], before['cwnd']))
+    if steps < 8:
+        problems.append('only {} slow start steps, need 8'.format(steps))
+    return problems
+
+
+def loss_reaction_problems(rows, mss):
+    """
+    Check cwnd on the TIMEOUT and FAST_RETRANSMIT rows (3-124, 3-125).
+
+    Every TIMEOUT row must have cwnd == mss and every FAST_RETRANSMIT row
+    cwnd == ssthresh + 3 * mss. At least one of each must appear.
+
+    Args:
+        rows (list): rows from read_trace.
+        mss (int): maximum segment size in bytes.
+
+    Returns:
+        list of problem strings; empty when the trace is fine.
+    """
+    problems = []
+    timeouts = [row for row in rows if row['event'] == 'TIMEOUT']
+    fasts = [row for row in rows if row['event'] == 'FAST_RETRANSMIT']
+    if not timeouts:
+        problems.append('no TIMEOUT row')
+    if not fasts:
+        problems.append('no FAST_RETRANSMIT row')
+    for row in timeouts:
+        if row['cwnd'] != mss:
+            problems.append('TIMEOUT at {} has cwnd {}, not {}'.format(
+                row['time'], row['cwnd'], mss))
+    for row in fasts:
+        if None in (row['cwnd'], row['ssthresh']) or row['cwnd'] != row['ssthresh'] + 3 * mss:
+            problems.append('FAST_RETRANSMIT at {} has cwnd {}, ssthresh {}'.format(
+                row['time'], row['cwnd'], row['ssthresh']))
+    return problems

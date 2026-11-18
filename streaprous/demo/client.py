@@ -11,7 +11,7 @@ Commands:
             [--read-delay S] [--pause-after N] [--pause S] [--header-bytes N]
             [--timeout S]
     post URL --size N [--timeout S]
-    connect-close HOST PORT [--no-fin-check]
+    connect-close HOST PORT
 
 The last output line is always "RESULT k=v ..."; the exit code is 0 when the
 request (or the handshake) worked and the expectation holds, else 1.
@@ -314,11 +314,10 @@ def run_connect_close(args):
     Connect, wait, close our side and see whether the server closes too.
 
     Args:
-        args (Namespace): parsed command line (host, port, no_fin_check).
+        args (Namespace): parsed command line (host, port).
 
     Returns:
-        exit code, 0 when the handshake worked (and the server's FIN arrived,
-        unless --no-fin-check).
+        exit code, 0 when the handshake worked and the server's FIN arrived.
     """
     started = time.time()
     pairs = [('method', 'connect-close')]
@@ -348,7 +347,7 @@ def run_connect_close(args):
     pairs += [('handshake', 'ok'), ('server_fin', server_fin),
               ('seconds', '{:.3f}'.format(time.time() - started))]
     print(format_result(pairs))
-    return 0 if args.no_fin_check or server_fin == 'yes' else 1
+    return 0 if server_fin == 'yes' else 1
 
 
 def build_parser():
@@ -382,7 +381,6 @@ def build_parser():
     close = commands.add_parser('connect-close', help='connect, then close our side')
     close.add_argument('host')
     close.add_argument('port', type=int)
-    close.add_argument('--no-fin-check', action='store_true')
     return parser
 
 
