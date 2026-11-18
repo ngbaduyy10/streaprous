@@ -1,253 +1,239 @@
 """
-TCP receiver for StreapRous.
-
-Keeps the receiving side of one connection: in-order delivery with a
-buffer for out-of-order segments, the ACK rules of slide 3-85 and the
-receive window of slide 3-94. The class never touches sockets, threads
-or the clock: the caller passes segments and the current time ``now``
-and sends the ACKs the return values ask for.
+StreapRous TCP receiver
+The ACK rules of slide 3-85, in-order delivery and the window of slide 3-94.
+No sockets, no clock: the caller passes segments and ``now`` and sends the ACKs.
 """
+
+from .tcp_trace import no_log
+
+DELAYED_ACK_WAIT = 0.1  # slide 3-85: "wait up to 500ms"; we wait 100 ms
 
 
 class TcpReceiver:
-    """
-    Receiving side of one TCP connection.
+    """Receiving side of one TCP connection; sequence numbers are plain ints."""
 
-    Sequence numbers are plain ints (already unwrapped). ``ready`` holds
-    in-order bytes the application has not read yet; ``out_of_order``
-    holds segments that arrived above ``rcv_nxt``.
-
-    Args:
-        rcv_nxt: Sequence number of the first byte we expect.
-        buffer_size: RcvBuffer in bytes (slide 3-94).
-        delayed_ack: Delayed-ACK time in seconds (slide 3-85, row 1).
-        on_event: Callback ``on_event(name, **details)`` for trace events.
-    """
-
-    def __init__(self, rcv_nxt, buffer_size, delayed_ack, on_event=None):
-        """Sets up the receiver.
+    def __init__(self, expected_seq_num, rcv_buffer, log=no_log):
+        """Sets up an empty receive buffer.
 
         Args:
-            rcv_nxt: First sequence number expected from the peer.
-            buffer_size: RcvBuffer in bytes (slide 3-94).
-            delayed_ack: Delayed-ACK time in seconds (slide 3-85, row 1).
-            on_event: Callback ``on_event(name, **details)`` for trace events.
+             expected_seq_num  seq # of the first byte we expect from the client
+             rcv_buffer        RcvBuffer in bytes (slide 3-94)
+             log               log(event, **details), called after each change
         """
-        self.rcv_nxt = rcv_nxt
-        self.buffer_size = buffer_size
-        self.delayed_ack = delayed_ack
-        self.on_event = on_event or (lambda name, **details: None)
-        self.ready = bytearray()
+        self.expected_seq_num = expected_seq_num
+        self.rcv_buffer = rcv_buffer
+        self.buffered_data = bytearray()
         self.out_of_order = {}
-        self.fin_seq = None
-        self.fin_received = False
-        self.last_byte_rcvd = 0
-        self.last_byte_read = 0
         self.ack_pending = False
         self.ack_deadline = None
-        self.last_advertised = buffer_size
+        self.fin_received = False
+        self.last_rwnd = rcv_buffer
+        self.log = log
 
-    def on_segment(self, seq, payload, fin, now):
-        """
-        Handle one arriving segment and pick the ACK rule (slide 3-85).
+    def on_segment(self, seq, data, fin, now):
+        """Handles one arriving segment and picks its ACK (slide 3-85, ACK generation).
 
-        Row 1: in-order segment, nothing pending -> delay the ACK.
-        Row 2: in-order segment while an ACK is pending -> ACK at once.
-        Row 3: segment above the expected number (a gap) -> duplicate ACK.
-        Row 4: segment that partly or fully fills a gap -> ACK at once.
-        Data past the right edge of the window (slide 3-94) is cut off.
+        An empty segment elsewhere than ``expected_seq_num`` is a probe and gets
+        an ACK. A FIN counts only on an in-order segment not cut at the window edge.
 
         Args:
-            seq: Sequence number of the first payload byte.
-            payload: Segment data (bytes, may be empty).
-            fin: True when the FIN flag is set.
-            now: Current time in seconds.
+             seq   seq # of the first data byte, already unwrapped
+             data  the payload bytes (may be empty)
+             fin   True when the FIN bit is set
+             now   the current time in seconds
 
         Returns:
-            str or None: Why an ACK must go out now ('cumulative',
-            'duplicate', 'gap_filled', 'fin', 'old_segment',
-            'out_of_window', 'probe'), or None when no ACK is needed yet.
+             the reason to send an ACK now, or None
         """
-        payload = bytes(payload)
-        if not payload and not fin:
-            # Pure ACK, or a zero-window probe / keepalive below rcv_nxt
-            return None if seq == self.rcv_nxt else 'probe'
-
-        end = seq + len(payload)
-        new_fin = fin and not self.fin_received
-        if end < self.rcv_nxt or (end == self.rcv_nxt and not new_fin):
-            self.on_event('DUP_SEGMENT', seq=seq, len=len(payload))
+        data = bytes(data)
+        if not data and not fin:
+            return None if seq == self.expected_seq_num else 'probe'
+        if self.is_old_segment(seq, data, fin):
+            self.log('DUP_SEGMENT', seq=seq, len=len(data))
             return 'old_segment'
-
-        if seq < self.rcv_nxt:
-            payload = payload[self.rcv_nxt - seq:]
-            seq = self.rcv_nxt
-
-        right_edge = self.rcv_nxt + self.window()
-        if seq + len(payload) > right_edge:
-            self.on_event('OUT_OF_WINDOW', seq=seq, len=len(payload),
-                          window=self.window())
-            payload = payload[:max(0, right_edge - seq)]
-            fin = False
-        if fin and self.fin_seq is None:
-            self.fin_seq = seq + len(payload)
-        if not payload and not fin:
+        seq, data, fin = self.trim_to_window(seq, data, fin)
+        if not data and not fin:
             return 'out_of_window'
-
-        if seq > self.rcv_nxt:
-            if payload:
-                self._store_out_of_order(seq, payload)
+        if seq > self.expected_seq_num:
+            if data:
+                self.store_out_of_order(seq, data)
             return 'duplicate'
-
-        had_gap = bool(self.out_of_order)
-        self._deliver_in_order(payload)
-        self._pull_from_out_of_order()
-
-        if self.fin_seq is not None and self.rcv_nxt == self.fin_seq:
-            self.rcv_nxt += 1
+        gap_was_open = bool(self.out_of_order)
+        self.deliver_in_order(data)
+        if fin:
+            # Nothing can follow a FIN, so it is taken before the stored segments
             self.fin_received = True
-            self.on_event('FIN_RECEIVED', seq=self.fin_seq)
+            self.expected_seq_num += 1
+            self.log('FIN_RECEIVED', seq=self.expected_seq_num - 1)
             return 'fin'
-        if had_gap:
+        self.deliver_from_out_of_order()
+        return self.choose_ack(gap_was_open, now)
+
+    def is_old_segment(self, seq, data, fin):
+        """Tells whether every byte of the segment was received before.
+
+        Slide 3-86, lost ACK scenario: the ACK was lost, the sender resends,
+        and B ACKs the copy again. A FIN at ``expected_seq_num`` is still new.
+
+        Args:
+             seq   seq # of the first data byte
+             data  the payload bytes
+             fin   True when the FIN bit is set
+
+        Returns:
+             True when the segment brings nothing new
+        """
+        end = seq + len(data)
+        return end < self.expected_seq_num or (end == self.expected_seq_num and not fin)
+
+    def trim_to_window(self, seq, data, fin):
+        """Cuts the bytes we already have and the bytes past the free space.
+
+        Slide 3-94: keeping only what fits in rwnd "guarantees receive buffer will
+        not overflow". When the end is cut, the FIN goes too; the client resends it.
+
+        Args:
+             seq   seq # of the first data byte
+             data  the payload bytes
+             fin   True when the FIN bit is set
+
+        Returns:
+             (seq, data, fin) of the part that fits
+        """
+        if seq < self.expected_seq_num:
+            data = data[self.expected_seq_num - seq:]
+            seq = self.expected_seq_num
+        right_edge = self.expected_seq_num + self.rwnd()
+        if seq + len(data) > right_edge:
+            self.log('OUT_OF_WINDOW', seq=seq, len=len(data), rwnd=self.rwnd())
+            data = data[:max(0, right_edge - seq)]
+            fin = False
+        return seq, data, fin
+
+    def store_out_of_order(self, seq, data):
+        """Keeps a segment above a gap (slide 3-85, row 3).
+
+        Slide 3-85: "immediately send duplicate ACK, indicating seq. # of next expected
+        byte". Keeping it is "up to implementor" (slide 3-79): we keep the longer copy.
+
+        Args:
+             seq   seq # of the first byte, above ``expected_seq_num``
+             data  the payload bytes, already cut to the window
+        """
+        old = self.out_of_order.get(seq)
+        if old is None or len(data) > len(old):
+            self.out_of_order[seq] = data
+        self.log('OUT_OF_ORDER', seq=seq, len=len(data), expected=self.expected_seq_num)
+
+    def deliver_in_order(self, data):
+        """Adds in-order bytes to the buffer and moves the ACK number on.
+
+        Slide 3-79: the ACK is the "seq # of next byte expected from other side".
+
+        Args:
+             data  bytes that start exactly at ``expected_seq_num``
+        """
+        if not data:
+            return
+        self.buffered_data.extend(data)
+        self.expected_seq_num += len(data)
+        self.log('RECV', seq=self.expected_seq_num - len(data), len=len(data))
+
+    def deliver_from_out_of_order(self):
+        """Delivers the stored segments that now touch ``expected_seq_num``.
+
+        Only new tails go in, so each byte is delivered once; ones fully below are dropped.
+        """
+        for seq in sorted(self.out_of_order):
+            if seq > self.expected_seq_num:
+                break
+            data = self.out_of_order.pop(seq)
+            if seq + len(data) > self.expected_seq_num:
+                self.deliver_in_order(data[self.expected_seq_num - seq:])
+
+    def choose_ack(self, gap_was_open, now):
+        """Picks the ACK for an in-order segment (slide 3-85, rows 1, 2 and 4).
+
+        Row 4: the segment fills a gap: "immediate send ACK, provided that
+        segment starts at lower end of gap". Row 2: one other segment has an
+        ACK pending: "immediately send single cumulative ACK". Row 1: delayed
+        ACK, "Wait up to 500ms for next segment"; we wait DELAYED_ACK_WAIT.
+
+        Args:
+             gap_was_open  True when segments were stored above a gap
+             now           the current time in seconds
+
+        Returns:
+             'gap_filled', 'cumulative', or None while the ACK waits
+        """
+        if gap_was_open:
             return 'gap_filled'
         if self.ack_pending:
             return 'cumulative'
         self.ack_pending = True
-        self.ack_deadline = now + self.delayed_ack
+        self.ack_deadline = now + DELAYED_ACK_WAIT
         return None
 
-    def _deliver_in_order(self, payload):
-        """
-        Append in-order bytes to the ready buffer (slide 3-80).
-
-        Args:
-            payload: Bytes that start exactly at ``rcv_nxt``.
-        """
-        if not payload:
-            return
-        self.on_event('RECV', seq=self.rcv_nxt, len=len(payload))
-        self.ready.extend(payload)
-        self.rcv_nxt += len(payload)
-        self.last_byte_rcvd += len(payload)
-
-    def _store_out_of_order(self, seq, payload):
-        """
-        Keep a segment that arrived above ``rcv_nxt`` (slide 3-85, row 3).
-
-        When a segment with the same sequence number is already stored,
-        the longer one is kept.
-
-        Args:
-            seq: Sequence number of the first byte, above ``rcv_nxt``.
-            payload: Segment data, already cut to the window.
-        """
-        old = self.out_of_order.get(seq)
-        if old is None or len(payload) > len(old):
-            self.out_of_order[seq] = payload
-        self.on_event('OUT_OF_ORDER', seq=seq, len=len(payload),
-                      expected=self.rcv_nxt)
-
-    def _pull_from_out_of_order(self):
-        """
-        Move stored segments that now touch ``rcv_nxt`` into the ready buffer.
-
-        Segments fully below ``rcv_nxt`` are dropped; a segment that
-        overlaps it gives only its new tail, so every byte is delivered once.
-        """
-        for seq in sorted(self.out_of_order):
-            if seq > self.rcv_nxt:
-                break
-            data = self.out_of_order.pop(seq)
-            if seq + len(data) > self.rcv_nxt:
-                self._deliver_in_order(data[self.rcv_nxt - seq:])
-
     def on_tick(self, now):
-        """
-        Check the delayed-ACK timer (slide 3-85, row 1).
+        """Checks the delayed ACK (slide 3-85, row 1: "If no next segment, send ACK").
 
         Args:
-            now: Current time in seconds.
+             now  the current time in seconds
 
         Returns:
-            str or None: 'delayed' when a pending ACK's timer has expired,
-            else None. The ACK stays pending until ``ack_sent`` is called.
+             'delayed' when the wait is over, else None
         """
-        if self.ack_pending and self.ack_deadline is not None and now >= self.ack_deadline:
+        if self.ack_pending and now >= self.ack_deadline:
             return 'delayed'
         return None
 
     def read(self, max_bytes=None):
-        """
-        Hand in-order bytes to the application, which opens the window (slide 3-94).
+        """Gives in-order bytes to the application, which frees buffer space.
+
+        Slide 3-90: "Application removing data from TCP socket buffers".
 
         Args:
-            max_bytes: Most bytes to return; None returns everything ready.
+             max_bytes  the most bytes to return; None returns all
 
         Returns:
-            bytes: The data read (b"" when nothing is ready).
+             the bytes read (b'' when the buffer is empty)
         """
-        if max_bytes is None or max_bytes > len(self.ready):
-            max_bytes = len(self.ready)
+        if max_bytes is None or max_bytes > len(self.buffered_data):
+            max_bytes = len(self.buffered_data)
         if max_bytes <= 0:
-            return b""
-        data = bytes(self.ready[:max_bytes])
-        del self.ready[:max_bytes]
-        self.last_byte_read += len(data)
-        self.on_event('APP_READ', bytes=len(data))
+            return b''
+        data = bytes(self.buffered_data[:max_bytes])
+        del self.buffered_data[:max_bytes]
+        self.log('APP_READ', bytes=len(data))
         return data
 
     def readable(self):
-        """
-        Tell whether ``read`` has something to report.
+        """Tells whether ``read`` has bytes, or the client's FIN has come."""
+        return len(self.buffered_data) > 0 or self.fin_received
 
-        Returns:
-            bool: True when in-order bytes are ready or the FIN has arrived.
-        """
-        return len(self.ready) > 0 or self.fin_received
+    def rwnd(self):
+        """Computes the window we advertise: RcvBuffer minus buffered data.
 
-    def window(self):
+        Slide 3-94: the receiver "advertises" free buffer space in rwnd field.
+        Out-of-order bytes lie inside the window already advertised, so they do not count.
         """
-        Compute the receive window to advertise (slide 3-94).
-
-        rwnd = RcvBuffer - (LastByteRcvd - LastByteRead). Out-of-order
-        bytes are not counted: they sit inside the advertised space.
-
-        Returns:
-            int: Free space in bytes, between 0 and ``buffer_size``.
-        """
-        free = self.buffer_size - (self.last_byte_rcvd - self.last_byte_read)
-        return max(0, min(self.buffer_size, free))
+        return self.rcv_buffer - len(self.buffered_data)
 
     def window_update_due(self):
-        """
-        Tell whether a window update must be sent now (slide 3-94).
+        """Tells whether to send an ACK only to announce that space opened.
 
-        True when the last advertised window was below a quarter of the
-        buffer and the free space has grown to at least that quarter, so
-        a sender stalled on a small window learns that it may go on.
-
-        Returns:
-            bool: True when an ACK with the new window should go out.
+        extra: one ACK when the free space grows from below a quarter of RcvBuffer
+        to at least a quarter. The window only travels in segments we send (slide
+        3-94), so after a zero or small window nothing else would tell the sender.
         """
-        quarter = self.buffer_size // 4
-        return self.last_advertised < quarter <= self.window()
+        return self.last_rwnd < self.rcv_buffer // 4 <= self.rwnd()
 
-    def ack_sent(self, window):
-        """
-        Record that a segment carrying ack=rcv_nxt was sent.
+    def ack_sent(self, rwnd):
+        """Notes that a segment with ACK = ``expected_seq_num`` went out.
 
         Args:
-            window: The window that segment advertised.
+             rwnd  the window that segment advertised
         """
         self.ack_pending = False
         self.ack_deadline = None
-        self.last_advertised = window
-
-    def next_deadline(self):
-        """
-        Give the time the delayed-ACK timer fires.
-
-        Returns:
-            float or None: The deadline, or None when no ACK is pending.
-        """
-        return self.ack_deadline if self.ack_pending else None
+        self.last_rwnd = rwnd
