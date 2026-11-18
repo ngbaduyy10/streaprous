@@ -133,7 +133,7 @@ SCENARIOS = [
     },
     {
         'name': 'trace',
-        'image': 'lab', 'env': {'STREAPROUS_DROP_SEND': '150,400-402'},
+        'image': 'lab', 'env': {'STREAPROUS_DROP_SEND': '150,400-460'},
         'server_netem': 'delay 20ms', 'client_netem': 'delay 20ms',
         'steps': [GET_1M],
         'checks': [
