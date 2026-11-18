@@ -8,34 +8,15 @@ import os
 import time
 
 CSV_COLUMNS = ('time', 'event', 'cwnd', 'ssthresh', 'rwnd', 'in_flight',
-               'snd_una', 'snd_nxt', 'adv_wnd')
+               'send_base', 'next_seq_num', 'adv_rwnd')
 
-# Level 0 prints only DROP, level 1 the key events, level 2 every segment.
-EVENT_LEVELS = {
-    'OPEN': 1, 'SEND': 2, 'RETRANSMIT': 1, 'ACK': 2, 'DUPACK': 1,
-    'FAST_RETRANSMIT': 1, 'TIMEOUT': 1, 'RTT': 2, 'RWND_ZERO': 1,
-    'RWND_OPEN': 1, 'PROBE': 1, 'FIN_SENT': 1, 'GIVE_UP': 1, 'STATE': 1,
-    'RECV': 2, 'OUT_OF_ORDER': 1, 'DUP_SEGMENT': 1, 'OUT_OF_WINDOW': 1,
-    'FIN_RECEIVED': 1, 'APP_READ': 2, 'ACK_SENT': 2, 'DUP_ACK_SENT': 1,
-    'WINDOW_ZERO': 1, 'WINDOW_UPDATE': 1, 'DROP': 0, 'RESET': 1,
-    'IGNORED': 2, 'CLOSE': 1,
-}
+# These events go to the CSV only: one per segment would flood the log.
+QUIET_EVENTS = frozenset(['SEND', 'ACK', 'RTT', 'RECV', 'APP_READ', 'ACK_SENT'])
 
 
 def no_log(event, **details):
     """Ignores one log event; the default log of the TCP classes."""
     return None
-
-
-def _value_text(value):
-    """Writes one detail value; floats get 3 decimals.
-
-    Args:
-         value  number or text
-    """
-    if isinstance(value, float):
-        return '%.3f' % value
-    return str(value)
 
 
 def format_line(name, event, details, state):
@@ -51,10 +32,13 @@ def format_line(name, event, details, state):
          the line, starting with [Streap_tcp]
     """
     parts = ['[Streap_tcp]', name, event]
-    parts.extend('%s=%s' % (key, _value_text(value)) for key, value in details)
+    for key, value in details:
+        if isinstance(value, float):
+            value = '%.3f' % value
+        parts.append('%s=%s' % (key, value))
     parts.append('| cwnd=%s ssthresh=%s rwnd=%s flight=%s adv=%s' % (
         state.get('cwnd', ''), state.get('ssthresh', ''), state.get('rwnd', ''),
-        state.get('in_flight', ''), state.get('adv_wnd', '')))
+        state.get('in_flight', ''), state.get('adv_rwnd', '')))
     return ' '.join(parts)
 
 
@@ -62,67 +46,54 @@ class TcpTrace:
     """Logs events and records them in a CSV file.
 
     Args:
-         name       connection name, "<client_ip>:<client_port>"
-         log_level  0, 1 or 2
-         csv_path   file to write, or None for no file
-         clock      function returning seconds
-         write      function that prints one line
+         name      connection name, "<client_ip>:<client_port>"
+         csv_path  file to write, or None for no file
+         write     function that prints one line
+         clock     function returning seconds
     """
 
-    def __init__(self, name, log_level, csv_path=None, clock=time.monotonic, write=print):
+    def __init__(self, name, csv_path=None, write=print, clock=time.monotonic):
         """Sets up the trace.
 
         Args:
-             name       connection name for log lines, such as the client address
-             log_level  0 only DROP, 1 key events, 2 every segment
-             csv_path   file to write, or None for no file
-             clock      function returning seconds
-             write      function that prints one line
+             name      connection name for log lines, such as the client address
+             csv_path  file to write, or None for no file
+             write     function that prints one line
+             clock     function returning seconds
         """
         self.name = name
-        self.log_level = log_level
         self.csv_path = csv_path
-        self.clock = clock
         self.write = write
+        self.clock = clock
         self.start = clock()
-        self._file = None
-        self._writer = None
+        self.file = None
+        self.writer = None
 
     def event(self, event, state, **details):
-        """Records one event.
+        """Records one event: prints it unless it is quiet, and adds a CSV row.
 
         Args:
-             event    event name from EVENT_LEVELS
-             state    dict with the 7 numeric CSV keys
+             event    event name
+             state    dict with the numeric CSV keys
              details  extra key=value pairs for the log line
         """
-        if EVENT_LEVELS.get(event, 1) <= self.log_level:
+        if event not in QUIET_EVENTS:
             self.write(format_line(self.name, event, list(details.items()), state))
-        if self.csv_path is not None:
-            self._write_row(event, state)
-
-    def _write_row(self, event, state):
-        """Appends one CSV row, creating the file on first use.
-
-        Args:
-             event  event name
-             state  dict with the numeric CSV keys
-        """
-        if self._file is None:
+        if self.csv_path is None:
+            return
+        if self.file is None:
             folder = os.path.dirname(self.csv_path)
             if folder:
                 os.makedirs(folder, exist_ok=True)
-            self._file = open(self.csv_path, 'w', newline='')
-            self._writer = csv.writer(self._file)
-            self._writer.writerow(CSV_COLUMNS)
+            self.file = open(self.csv_path, 'w', newline='')
+            self.writer = csv.writer(self.file)
+            self.writer.writerow(CSV_COLUMNS)
         row = ['%.4f' % (self.clock() - self.start), event]
         row.extend(state.get(key, '') for key in CSV_COLUMNS[2:])
-        self._writer.writerow(row)
-        self._file.flush()
+        self.writer.writerow(row)
 
     def close(self):
         """Closes the CSV file if it was opened."""
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-            self._writer = None
+        if self.file is not None:
+            self.file.close()
+            self.file = None

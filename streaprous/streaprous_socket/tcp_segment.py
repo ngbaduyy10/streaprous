@@ -90,22 +90,12 @@ def wrap(value):
 def unwrap(value, near):
     """Turns a 32-bit wire value back into an unbounded sequence number.
 
-    Picks the integer equal to value modulo 2^32 that is closest to near
-    (the sequence space of slide 3-79 wraps around).
+    Slide 3-78: "counting bytes of data into bytestream", so the number
+    keeps growing; only the wire copy is cut to 32 bits. This picks the
+    integer equal to value modulo 2^32 that is closest to near.
 
     Args:
          value  32-bit number read from a header
          near   unbounded number it should be close to
     """
     return near + ((value - near + SEQ_MOD // 2) % SEQ_MOD) - SEQ_MOD // 2
-
-
-def flag_names(flags):
-    """Names the flags that are set, such as 0x12 -> "SYN,ACK".
-
-    Args:
-         flags  TCP flag byte
-    """
-    names = [name for bit, name in ((FIN, 'FIN'), (SYN, 'SYN'), (RST, 'RST'),
-                                    (PSH, 'PSH'), (ACK, 'ACK')) if flags & bit]
-    return ','.join(names)

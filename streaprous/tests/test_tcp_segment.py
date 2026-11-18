@@ -7,7 +7,10 @@ import unittest
 
 from streaprous_socket import tcp_segment
 from streaprous_socket.tcp_segment import (
-    ACK, FIN, PSH, RST, SYN, flag_names, parse_mss_option, parse_tcp_packet, unwrap, wrap)
+    ACK, FIN, PSH, RST, SYN, parse_mss_option, parse_tcp_packet, unwrap, wrap)
+from tests.slide_rules import assert_slide_rules
+
+SEGMENT_RULES = [('unwrap', '3-78', 'counting bytes of data into bytestream')]
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'fixtures', 'docker_client_packets.json')
@@ -179,20 +182,22 @@ class SequenceTest(unittest.TestCase):
                 self.assertEqual(unwrap(wrap(near + delta), near), near + delta)
 
 
-class FlagNamesTest(unittest.TestCase):
-    """flag_names lists flags in FIN, SYN, RST, PSH, ACK order."""
-
-    def test_names(self):
-        self.assertEqual(flag_names(0x12), 'SYN,ACK')
-        self.assertEqual(flag_names(0x18), 'PSH,ACK')
-        self.assertEqual(flag_names(0x11), 'FIN,ACK')
-        self.assertEqual(flag_names(RST), 'RST')
-        self.assertEqual(flag_names(0), '')
-        self.assertEqual(flag_names(FIN | SYN | RST | PSH | ACK), 'FIN,SYN,RST,PSH,ACK')
+class ConstantsTest(unittest.TestCase):
+    """Flag bits and the sequence space."""
 
     def test_constants(self):
         self.assertEqual((FIN, SYN, RST, PSH, ACK), (1, 2, 4, 8, 16))
         self.assertEqual(tcp_segment.SEQ_MOD, 2 ** 32)
+
+    def test_flag_names_is_gone(self):
+        self.assertFalse(hasattr(tcp_segment, 'flag_names'))
+
+
+class SlideRulesTest(unittest.TestCase):
+    """The docstring of unwrap carries its slide rule."""
+
+    def test_slide_rules(self):
+        assert_slide_rules(self, 'tcp_segment', SEGMENT_RULES)
 
 
 if __name__ == '__main__':
