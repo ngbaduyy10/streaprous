@@ -678,6 +678,7 @@ def run_conn_send(s: socket.socket, conn_info: conn_struct, payload: bytes) -> i
     Returns:
         int: Number of bytes sent, or -1 on error
     """
+    # TEAM: returns only when every byte is ACKed, or -1 if the connection breaks
     client_ip = conn_info.client_ip
     client_port = conn_info.client_port
     client_key = (client_ip, client_port)

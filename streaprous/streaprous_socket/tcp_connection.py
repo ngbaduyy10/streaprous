@@ -1,10 +1,9 @@
 """
 StreapRous TCP connection
-Joins the TCP sender and receiver to the raw socket of one connection.
-A worker thread per connection is the only reader of the dispatcher's
-per-connection queue: it feeds ACKs to the sender, data to the receiver and
-runs the timers. The handler thread calls recv, send and close, which wait
-on the connection's condition until the worker has done its part.
+Joins the TCP sender and receiver to the raw socket of one connection. A worker thread
+reads the connection's queue, feeds ACKs to the sender and data to the receiver, and runs
+the timers. recv, send and close wait on the connection's condition. Every segment we send
+goes out through put_on_wire.
 """
 
 import os
@@ -13,16 +12,12 @@ import socket
 import struct
 import threading
 import time
+from collections import namedtuple
 
-from .streaprous_raw_connection import (
-    build_tcp_packet,
-    build_ip_header,
-    send_tcp_data_segment,
-    connections,
-    connections_lock,
-)
+from .streaprous_raw_connection import (build_tcp_packet, build_ip_header,
+                                        send_tcp_data_segment, connections, connections_lock)
 from .streaprous_packet_dispatcher import get_packet_queue
-from .tcp_config import SETTINGS, describe
+from .tcp_config import SETTINGS
 from .tcp_loss import LossInjector
 from .tcp_receiver import TcpReceiver
 from .tcp_reno import RenoCongestion
@@ -31,131 +26,123 @@ from .tcp_segment import ACK, FIN, RST, SYN, parse_mss_option, parse_tcp_packet,
 from .tcp_sender import TcpSender
 from .tcp_trace import TcpTrace
 
-# Most packets the worker takes from the queue before it runs the timers.
-_BATCH = 64
+MAX_MSS = 1460          # extra: largest MSS we use, the client's option at most
+DEFAULT_MSS = 536       # extra: MSS when the client's SYN had no MSS option
+PEER_SILENCE = 10.0     # extra: give up after 10 s without any segment while data waits
+LINGER = 2.0            # extra: wait up to 2 s for the client's FIN after ours is ACKed
+TICK = 0.01             # the worker runs the timers at least every 10 ms
+
+# From the client's SYN; mss is None when the SYN had no MSS option.
+SynInfo = namedtuple('SynInfo', ['mss', 'window', 'seq'])
+
+
+def choose_mss(syn):
+    """Picks the MSS of the connection.
+
+    extra: the client's MSS option, at most 1460 bytes; 536 bytes without it. The
+    slides give MSS no value, and a larger segment than the client asked for may never arrive.
+
+    Args:
+         syn  SynInfo of the client's SYN, or None when no SYN was noted
+
+    Returns:
+         the MSS in bytes
+    """
+    if syn is not None and syn.mss is not None:
+        return min(MAX_MSS, syn.mss)
+    return DEFAULT_MSS
 
 
 class TcpConnection:
-    """One TCP connection on the raw socket.
+    """One TCP connection on the raw socket; cond guards all of its state.
 
-    Args:
-         sock          raw socket used for sendto
-         conn_info     conn_struct of the established connection
-         packet_queue  the dispatcher's queue.Queue for this connection
-         peer_mss      MSS the client asked for in its SYN
-         peer_window   window of the client's SYN, or None when unknown
-         settings      settings object from tcp_config.load_settings
-         clock         function returning seconds
-         syn_seq       sequence number of the client's SYN, or None when unknown
+    Attributes:
+         broken      None, or 'reset', 'silence' or 'error' once the connection broke
+         closing     True once close() was called; finished once it is done
+         last_heard  when the last segment from the client came
     """
 
-    def __init__(self, sock, conn_info, packet_queue, peer_mss, peer_window, settings,
-                 clock=time.monotonic, syn_seq=None):
+    def __init__(self, sock, conn_info, packet_queue, syn=None, settings=SETTINGS,
+                 clock=time.monotonic):
         """Builds the sender, receiver and helpers; the worker starts in start().
 
         Args:
              sock          raw socket used for sendto
              conn_info     conn_struct of the established connection
              packet_queue  the dispatcher's queue.Queue for this connection
-             peer_mss      MSS the client asked for in its SYN
-             peer_window   window of the client's SYN, or None when unknown
+             syn           SynInfo of the client's SYN, or None when none was noted
              settings      settings object from tcp_config.load_settings
-             clock=time.monotonic  function returning seconds
-             syn_seq=None  sequence number of the client's SYN, or None when unknown
+             clock         function returning seconds
         """
         self.sock = sock
         self.conn_info = conn_info
         self.queue = packet_queue
         self.settings = settings
         self.clock = clock
-        self.client_ip = conn_info.client_ip
-        self.client_port = conn_info.client_port
-        self.server_ip = conn_info.server_ip
-        self.server_port = conn_info.server_port
-        self.key = (self.client_ip, self.client_port)
+        self.key = (conn_info.client_ip, conn_info.client_port)
         self.name = '%s:%d' % self.key
-
-        self.peer_mss = peer_mss
-        self.mss = min(settings.mss_limit, peer_mss)
-        self.iss = conn_info.server_seq
-        # The first data byte is SYN seq + 1. The handshake's third packet can be a
-        # reordered data segment, so its seq is used only when the SYN was not seen.
-        if syn_seq is not None:
-            self.irs = wrap(syn_seq + 1)
-        else:
-            self.irs = conn_info.client_seq
-        rwnd = peer_window if peer_window is not None else self.mss
-
+        self.mss = choose_mss(syn)
+        # The client's first data byte is SYN seq + 1. The handshake's third packet
+        # can be a reordered data segment, so accept's client_seq is used only without a SYN.
+        first_client_byte = conn_info.client_seq if syn is None else wrap(syn.seq + 1)
+        rwnd = self.mss if syn is None else syn.window
         self.cond = threading.Condition()
-        csv_path = None
-        if settings.trace:
-            csv_path = os.path.join(settings.trace_dir,
-                                    'trace_%s_%d.csv' % (self.client_ip, self.client_port))
-        self.trace = TcpTrace(self.name, settings.log_level, csv_path, clock=clock)
-        self.rtt = RttEstimator(settings.initial_rto, settings.min_rto, settings.max_rto)
-        self.cc = RenoCongestion(self.mss, settings.initial_ssthresh, self._on_event)
-        self.sender = TcpSender(self.iss, self.mss, rwnd, self.rtt, self.cc,
-                                settings.max_retries, settings.persist_min,
-                                settings.persist_max, self._on_event)
-        self.receiver = TcpReceiver(self.irs, settings.recv_buffer, settings.delayed_ack,
-                                    self._on_event)
-        self.loss = LossInjector(settings.drop_send, settings.drop_recv,
-                                 settings.loss_rate, settings.loss_seed)
-
-        # The SYN-ACK advertised the whole buffer.
-        self.adv_wnd = settings.recv_buffer
-        self.reset = False
+        csv_path = os.path.join(settings.trace_dir, 'trace_%s_%d.csv' % self.key)
+        if not settings.trace:
+            csv_path = None
+        self.trace = TcpTrace(self.name, csv_path, clock=clock)
+        self.rtt = RttEstimator()
+        self.reno = RenoCongestion(self.mss, log=self.log)
+        self.sender = TcpSender(conn_info.server_seq, self.mss, rwnd, self.reno, self.rtt,
+                                self.log)
+        self.receiver = TcpReceiver(first_client_byte, settings.rcv_buffer, self.log)
+        self.loss = LossInjector(settings.drop_send, settings.loss_rate, settings.loss_seed)
+        self.broken = None
         self.closing = False
         self.finished = False
-        self.received = 0
         self.started_at = clock()
-        self.last_peer_time = self.started_at
-        self._thread = None
-
-    # ------------------------------------------------------------------
-    # Worker side
-    # ------------------------------------------------------------------
+        self.last_heard = self.started_at
+        self.thread = None
 
     def start(self):
         """Logs OPEN and starts the worker thread "tcp-<ip>:<port>"."""
-        self._on_event('OPEN', iss=self.iss, irs=self.irs, mss=self.mss,
-                       peer_mss=self.peer_mss, rcvbuf=self.settings.recv_buffer,
-                       rwnd=self.sender.rwnd, settings=describe(self.settings))
-        self._thread = threading.Thread(target=self._worker, daemon=True,
-                                        name='tcp-' + self.name)
-        self._thread.start()
+        drop_send = ','.join(str(n) for n in sorted(self.settings.drop_send)) or '-'
+        self.log('OPEN', mss=self.mss, rwnd=self.sender.rwnd,
+                 rcv_buffer=self.settings.rcv_buffer, send_base=self.sender.send_base,
+                 expected=self.receiver.expected_seq_num, drop_send=drop_send,
+                 loss=self.settings.loss_rate, trace=self.settings.trace)
+        self.thread = threading.Thread(target=self.worker, daemon=True, name='tcp-' + self.name)
+        self.thread.start()
 
-    def _worker(self):
-        """Reads the queue, handles packets and timers until the connection is finished."""
+    def worker(self):
+        """Takes one packet at a time from the queue and runs the timers every TICK.
+
+        Any error breaks the connection and stops the worker.
+        """
         while not self.finished:
-            packets = []
             try:
-                packets.append(self.queue.get(timeout=self.settings.tick))
-                while len(packets) < _BATCH:
-                    packets.append(self.queue.get_nowait())
+                packet = self.queue.get(timeout=TICK)[0]
             except queue.Empty:
-                pass
+                packet = None
             with self.cond:
                 if self.finished:
-                    break
+                    return
                 try:
                     now = self.clock()
-                    for packet, _addr in packets:
+                    if packet is not None:
                         self.process_packet(packet, now)
                     self.process_timers(now)
                 except Exception as err:
                     print('[Streap_tcp] %s worker error: %r' % (self.name, err))
-                    self.sender.gave_up = True
-                    self._on_event('GIVE_UP', reason='error')
-                    self.cond.notify_all()
-                    break
+                    self.give_up('error')
+                    return
                 self.cond.notify_all()
 
     def process_packet(self, packet, now):
         """Handles one packet from the queue; the caller holds self.cond.
 
-        The ACK field goes to the sender, the data and FIN to the receiver,
-        which says whether an ACK must go out now (slide 3-85).
+        The ACK field goes to the sender (slide 3-84), then the data and FIN to the
+        receiver, which says whether an ACK must go out now (slide 3-85).
 
         Args:
              packet  IP datagram bytes from the raw socket
@@ -164,207 +151,176 @@ class TcpConnection:
         seg = parse_tcp_packet(packet)
         if seg is None:
             return
-        if seg.src_port != self.client_port or seg.dst_port != self.server_port:
+        if seg.src_port != self.conn_info.client_port or seg.dst_port != self.conn_info.server_port:
             return
-        self.last_peer_time = now
+        self.last_heard = now
         if seg.flags & RST:
-            self.reset = True
-            self._on_event('RESET')
+            self.broken = 'reset'
+            self.log('RESET')
             return
         if seg.flags & SYN:
-            self._on_event('IGNORED', why='syn')
             return
-        payload = seg.payload
-        if payload:
-            why = self.loss.check_recv()
-            if why:
-                self._on_event('DROP', dir='recv', why=why,
-                               seq=unwrap(seg.seq, self.receiver.rcv_nxt), len=len(payload))
-                return
-            self.received += 1
         fin = bool(seg.flags & FIN)
         if seg.flags & ACK:
-            ack = unwrap(seg.ack, self.sender.snd_una)
-            # a FIN is not a duplicate ACK either (RFC 5681, background)
-            self._transmit(self.sender.on_ack(ack, seg.window, bool(payload) or fin, now), now)
-        reason = self.receiver.on_segment(unwrap(seg.seq, self.receiver.rcv_nxt),
-                                          payload, fin, now)
+            ack = unwrap(seg.ack, self.sender.send_base)
+            carries_data = bool(seg.payload) or fin
+            self.send_segments(self.sender.on_ack(ack, seg.window, carries_data, now))
+        seq = unwrap(seg.seq, self.receiver.expected_seq_num)
+        reason = self.receiver.on_segment(seq, seg.payload, fin, now)
         if reason:
-            self._send_ack(reason, now)
+            self.send_ack(reason)
 
     def process_timers(self, now):
-        """Runs the sender's timers and the delayed ACK; the caller holds self.cond.
+        """Runs the timers; the caller holds self.cond.
+
+        The sender's timer and probe timer, then the delayed ACK of slide 3-85.
+        extra: we give up after 10 s without any segment from the client while data
+        waits; else a vanished client keeps the timer resending and send waits forever.
 
         Args:
              now  current time in seconds
         """
-        self._transmit(self.sender.on_tick(now), now)
+        if self.broken is not None:
+            return
+        self.send_segments(self.sender.on_tick(now))
         if self.receiver.on_tick(now):
-            self._send_ack('delayed', now)
-        waiting = (self.sender.bytes_in_flight() > 0
-                   or self.sender.snd_nxt < self.sender.data_end())
-        if (waiting and not self.sender.gave_up
-                and now - self.last_peer_time > self.settings.peer_silence):
-            self.sender.gave_up = True
-            self._on_event('GIVE_UP', reason='silence')
+            self.send_ack('delayed')
+        waiting = (self.sender.in_flight() > 0
+                   or self.sender.next_seq_num < self.sender.data_end())
+        if waiting and now - self.last_heard > PEER_SILENCE:
+            self.give_up('silence')
 
-    def _transmit(self, segments, now):
-        """Puts the sender's segments on the wire, each carrying ack=rcv_nxt.
+    def send_segments(self, segments):
+        """Puts the sender's segments on the wire, unless the loss switch drops them.
 
         Args:
              segments  list of SendSegment from the sender
-             now       current time in seconds
         """
-        for seg in segments:
-            window = self.receiver.window()
-            ack_seq = wrap(self.receiver.rcv_nxt)
-            try:
-                if seg.payload:
-                    why = self.loss.check_send(seg.kind)
-                    if why:
-                        self._on_event('DROP', dir='send', why=why, seq=seg.seq,
-                                       len=len(seg.payload))
-                        continue
-                    send_tcp_data_segment(self.sock, self.server_ip, self.client_ip,
-                                          self.server_port, self.client_port,
-                                          seq=wrap(seg.seq), ack_seq=ack_seq,
-                                          payload=seg.payload, window=window)
-                else:
-                    tcp = build_tcp_packet(self.server_ip, self.client_ip, self.server_port,
-                                           self.client_port, seq=wrap(seg.seq),
-                                           ack_seq=ack_seq, ack=1, fin=1, window=window)
-                    self._sendto(tcp)
-            except OSError as err:
-                # counts as a lost segment; the timer resends it
-                print('[Streap_tcp] %s send error: %s' % (self.name, err))
-                continue
-            self._note_advertised(window)
-            self.receiver.ack_sent(window)
+        for segment in segments:
+            if segment.payload:
+                why = self.loss.check_send(segment.kind)
+                if why is not None:
+                    self.log('DROP', seq=segment.seq, len=len(segment.payload), why=why)
+                    continue
+            self.put_on_wire(segment.seq, segment.payload, segment.fin)
 
-    def _sendto(self, tcp):
-        """Adds the IP header and sends one TCP segment.
-
-        Args:
-             tcp  TCP header (and payload) bytes
-        """
-        ip_header = build_ip_header(self.server_ip, self.client_ip, socket.IPPROTO_TCP, len(tcp))
-        self.sock.sendto(ip_header + tcp, (self.client_ip, 0))
-
-    def _send_ack(self, reason, now):
-        """Sends a pure ACK for rcv_nxt with the current window (slides 3-85, 3-95).
-
-        The ACK rules of slide 3-85 pick when; the window field tells the
-        client how much free buffer space we have (slide 3-95).
+    def send_ack(self, reason):
+        """Sends a pure ACK with seq # NextSeqNum for the next byte we expect (slide 3-85).
 
         Args:
              reason  why the ACK goes out, such as 'delayed', 'duplicate' or 'window_update'
-             now     current time in seconds
         """
-        window = self.receiver.window()
-        ack = self.receiver.rcv_nxt
-        # pure ACKs carry snd_max, so a go-back after a timeout never puts
-        # them below what the client already has (BSD tcp_output, background)
-        tcp = build_tcp_packet(self.server_ip, self.client_ip, self.server_port,
-                               self.client_port, seq=wrap(self.sender.snd_max),
-                               ack_seq=wrap(ack), ack=1, window=window)
-        try:
-            self._sendto(tcp)
-        except OSError as err:
-            print('[Streap_tcp] %s send error: %s' % (self.name, err))
+        if not self.put_on_wire(self.sender.next_seq_num, b"", False):
             return
-        self._note_advertised(window)
-        self.receiver.ack_sent(window)
-        self._on_event('ACK_SENT', ack=ack, window=window, reason=reason)
+        ack = self.receiver.expected_seq_num
+        rwnd = self.receiver.last_rwnd
+        self.log('ACK_SENT', ack=ack, rwnd=rwnd, reason=reason)
         if reason == 'duplicate':
-            self._on_event('DUP_ACK_SENT', ack=ack)
+            self.log('DUP_ACK_SENT', ack=ack)
         elif reason == 'window_update':
-            self._on_event('WINDOW_UPDATE', window=window)
+            self.log('WINDOW_UPDATE', rwnd=rwnd)
 
-    def _note_advertised(self, window):
-        """Remembers the window we sent; logs WINDOW_ZERO when it closes.
+    def put_on_wire(self, seq, payload, fin):
+        """Sends one segment with ACK = expected seq # and our free buffer space.
+
+        Slide 3-94: TCP receiver "advertises" free buffer space in rwnd field
+        in TCP header. Any segment we send also clears a pending delayed ACK.
 
         Args:
-             window  window field of the segment just sent
-        """
-        old = self.adv_wnd
-        self.adv_wnd = window
-        if window == 0 and old > 0:
-            self._on_event('WINDOW_ZERO', ack=self.receiver.rcv_nxt)
-
-    def _state(self):
-        """Gives the numbers every trace row records.
+             seq      unbounded seq # of the segment
+             payload  data bytes, b"" for a FIN or pure ACK
+             fin      True to set the FIN bit
 
         Returns:
-             dict with the numeric CSV columns
+             True when sent; False on a send error, and the segment counts as lost
         """
-        return {
-            'cwnd': self.cc.cwnd,
-            'ssthresh': self.cc.ssthresh,
-            'rwnd': self.sender.rwnd,
-            'in_flight': self.sender.bytes_in_flight(),
-            'snd_una': self.sender.snd_una,
-            'snd_nxt': self.sender.snd_nxt,
-            'adv_wnd': self.adv_wnd,
-        }
+        info = self.conn_info
+        rwnd = self.receiver.rwnd()
+        ack_seq = wrap(self.receiver.expected_seq_num)
+        try:
+            if payload:
+                send_tcp_data_segment(self.sock, info.server_ip, info.client_ip,
+                                      info.server_port, info.client_port, seq=wrap(seq),
+                                      ack_seq=ack_seq, payload=payload, window=rwnd)
+            else:
+                tcp = build_tcp_packet(info.server_ip, info.client_ip, info.server_port,
+                                       info.client_port, seq=wrap(seq), ack_seq=ack_seq,
+                                       ack=1, fin=int(fin), window=rwnd)
+                ip_header = build_ip_header(info.server_ip, info.client_ip,
+                                            socket.IPPROTO_TCP, len(tcp))
+                self.sock.sendto(ip_header + tcp, (info.client_ip, 0))
+        except OSError as err:
+            print('[Streap_tcp] %s send error: %s' % (self.name, err))
+            return False
+        self.receiver.ack_sent(rwnd)
+        return True
 
-    def _on_event(self, name, **details):
-        """Passes one event to the trace with the current state.
+    def give_up(self, reason):
+        """Marks the connection broken and wakes the waiting calls.
 
         Args:
-             name     event name
+             reason  'silence' or 'error'
+        """
+        self.broken = reason
+        self.log('GIVE_UP', reason=reason)
+        self.cond.notify_all()
+
+    def wait_until(self, done, deadline=None):
+        """Waits on self.cond until done(), a broken or finished connection, or the deadline.
+
+        Args:
+             done      function returning True when the wait is over
+             deadline  clock time to stop at, or None to wait without a limit
+        """
+        while not done():
+            if self.broken is not None or self.finished:
+                return
+            if deadline is not None and self.clock() >= deadline:
+                return
+            self.cond.wait(0.1)
+
+    def log(self, event, **details):
+        """Passes one event to the trace with the current numbers.
+
+        Args:
+             event    event name
              details  key=value pairs for the log line
         """
-        self.trace.event(name, self._state(), **details)
+        self.trace.event(event, self.state(), **details)
 
-    def _update_table(self):
+    def state(self):
+        """Gives the numbers every trace row records."""
+        return {'cwnd': self.reno.cwnd, 'ssthresh': self.reno.ssthresh, 'rwnd': self.sender.rwnd,
+                'in_flight': self.sender.in_flight(), 'send_base': self.sender.send_base,
+                'next_seq_num': self.sender.next_seq_num, 'adv_rwnd': self.receiver.last_rwnd}
+
+    def update_table(self):
         """Writes our sequence numbers into the teacher's connections entry."""
         with connections_lock:
             entry = connections.get(self.key)
             if entry is not None:
                 connections[self.key] = entry._replace(
-                    server_seq=wrap(self.sender.snd_nxt),
-                    client_seq=wrap(self.receiver.rcv_nxt),
+                    server_seq=wrap(self.sender.next_seq_num),
+                    client_seq=wrap(self.receiver.expected_seq_num),
                     last_activity=time.time())
 
-    def _broken(self):
-        """Tells whether the connection was reset or gave up.
-
-        Returns:
-             True after an RST or a give-up
-        """
-        return self.reset or self.sender.gave_up
-
-    # ------------------------------------------------------------------
-    # Application side
-    # ------------------------------------------------------------------
-
     def recv(self, max_bytes=None, timeout=None):
-        """Returns the next in-order bytes of the stream.
-
-        The bytes need not match the client's send calls: TCP delivers a
-        byte stream. Reading frees buffer space, so a window update goes
-        out when the window grows past a quarter of the buffer.
+        """Returns the next in-order bytes; a window update follows if one is due.
 
         Args:
-             max_bytes=None  most bytes to return; None returns all that is ready
-             timeout=None    seconds to wait for bytes; None waits until they come
+             max_bytes  most bytes to return; None returns all that is ready
+             timeout    seconds to wait for bytes; None waits until they come
 
         Returns:
-             bytes; b"" when the client closed, the connection was reset or
-             gave up, or the timeout passed
+             bytes; b"" when the client closed, the connection broke or the timeout passed
         """
         with self.cond:
             deadline = None if timeout is None else self.clock() + timeout
-            while not self.receiver.readable():
-                if self._broken() or self.finished:
-                    break
-                if deadline is not None and self.clock() >= deadline:
-                    break
-                self.cond.wait(0.1)
+            self.wait_until(self.receiver.readable, deadline)
             data = self.receiver.read(max_bytes)
             if self.receiver.window_update_due():
-                self._send_ack('window_update', self.clock())
-            self._update_table()
+                self.send_ack('window_update')
+            self.update_table()
             return data
 
     def send(self, payload):
@@ -374,64 +330,50 @@ class TcpConnection:
              payload  bytes to send
 
         Returns:
-             len(payload), or -1 when the connection was reset, gave up or is closing
+             len(payload), 0 for b"", or -1 when the connection broke or is closing
         """
         if not payload:
             return 0
         with self.cond:
-            if self._broken() or self.closing or self.finished:
+            if self.broken is not None or self.closing:
                 return -1
-            now = self.clock()
-            self._transmit(self.sender.write(payload, now), now)
-            while not self.sender.data_acked():
-                if self._broken() or self.finished:
-                    self._update_table()
-                    return -1
-                self.cond.wait(0.1)
-            self._update_table()
+            self.send_segments(self.sender.send_data(payload, self.clock()))
+            self.wait_until(self.sender.data_acked)
+            self.update_table()
+            if not self.sender.data_acked():
+                return -1
             return len(payload)
 
     def close(self):
-        """Sends our FIN until it is ACKed, then waits for the client's FIN (slide 3-96).
+        """Sends our FIN until it is ACKed, then waits for the client's FIN.
 
-        The FIN takes one sequence number and the retransmission timer
-        resends it like data. After its ACK we linger up to settings.linger
-        seconds so the client's FIN gets an ACK, then the worker stops.
+        Slide 3-103: respond to received FIN with ACK; the worker sends that ACK.
+        extra: after our FIN is ACKed we wait up to 2 s for the client's FIN.
         """
         with self.cond:
             if self.finished:
                 return
             self.closing = True
-            if not self._broken():
-                now = self.clock()
-                self._transmit(self.sender.close(now), now)
-                while not self.sender.fin_acked() and not self._broken():
-                    self.cond.wait(0.1)
-                if self.sender.fin_acked():
-                    deadline = self.clock() + self.settings.linger
-                    while (not self.receiver.fin_received and not self.reset
-                           and self.clock() < deadline):
-                        self.cond.wait(0.1)
+            if self.broken is None:
+                self.send_segments(self.sender.close(self.clock()))
+                self.wait_until(self.sender.fin_acked)
+            if self.sender.fin_acked():
+                self.wait_until(lambda: self.receiver.fin_received, self.clock() + LINGER)
             self.finished = True
-            self._update_table()
-            self._on_event('CLOSE', sent=self.sender.segments_sent,
-                           retransmits=self.sender.retransmits,
-                           timeouts=self.sender.timeouts,
-                           fast_retransmits=self.sender.fast_retransmits,
-                           probes=self.sender.probes, received=self.received,
-                           seconds=self.clock() - self.started_at)
+            self.update_table()
+            self.log('CLOSE', seconds=self.clock() - self.started_at)
             self.trace.close()
             self.cond.notify_all()
 
 
-# Registry of live connections and of the SYN options seen by accept.
+# Registry of live connections and of the SYNs noted by accept.
 _connections = {}
 _syn_info = {}
 _registry_lock = threading.Lock()
 
 
 def note_client_syn(client_key, tcp_bytes):
-    """Remembers the MSS option, window and sequence number of a client's SYN.
+    """Remembers the MSS option, window and seq # of a client's SYN.
 
     Args:
          client_key  (client_ip, client_port)
@@ -442,7 +384,7 @@ def note_client_syn(client_key, tcp_bytes):
     seq = struct.unpack('!L', tcp_bytes[4:8])[0]
     window = struct.unpack('!H', tcp_bytes[14:16])[0]
     with _registry_lock:
-        _syn_info[client_key] = (parse_mss_option(tcp_bytes), window, seq)
+        _syn_info[client_key] = SynInfo(parse_mss_option(tcp_bytes), window, seq)
 
 
 def get_connection(sock, conn_info):
@@ -459,10 +401,8 @@ def get_connection(sock, conn_info):
     with _registry_lock:
         conn = _connections.get(key)
         if conn is None:
-            mss_option, window, syn_seq = _syn_info.pop(key, (None, None, None))
-            peer_mss = mss_option if mss_option is not None else SETTINGS.default_peer_mss
-            conn = TcpConnection(sock, conn_info, get_packet_queue(key), peer_mss, window,
-                                 SETTINGS, syn_seq=syn_seq)
+            conn = TcpConnection(sock, conn_info, get_packet_queue(key),
+                                 _syn_info.pop(key, None), SETTINGS)
             _connections[key] = conn
             conn.start()
         return conn
