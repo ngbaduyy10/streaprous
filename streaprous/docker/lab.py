@@ -169,8 +169,8 @@ SCENARIOS = [
     {
         'name': 'slow-app',
         'image': 'lab',
-        'env': {'STREAPROUS_RCVBUF': '16384', 'STREAPROUS_APP_READ_DELAY': '0.05',
-                'STREAPROUS_APP_READ_BYTES': '2048'},
+        'env': {'STREAPROUS_RCVBUF': '16080', 'STREAPROUS_APP_READ_DELAY': '0.05',
+                'STREAPROUS_APP_READ_BYTES': '2144'},
         'server_netem': None, 'client_netem': None,
         'steps': ['post {srv}/ --size 300000'],
         'checks': [
