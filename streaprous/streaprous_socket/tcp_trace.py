@@ -22,6 +22,11 @@ EVENT_LEVELS = {
 }
 
 
+def no_log(event, **details):
+    """Ignores one log event; the default log of the TCP classes."""
+    return None
+
+
 def _value_text(value):
     """Writes one detail value; floats get 3 decimals.
 
