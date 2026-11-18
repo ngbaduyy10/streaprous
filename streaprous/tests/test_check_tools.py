@@ -1,6 +1,8 @@
 """Tests for tools/check_hunks.py and tools/check_walkthrough.py."""
 
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -175,64 +177,214 @@ class TestSlides(unittest.TestCase):
 
 
 class TestWalkthrough(unittest.TestCase):
-    """Walkthrough check on a tiny repository in a temp directory."""
+    """Walkthrough check on a minimal valid document in a temporary root."""
+
+    FILES = {'R': 'tcp_sender.py:TcpSender.send_data',
+             'F': 'tcp_receiver.py:TcpReceiver.rwnd',
+             'C': 'tcp_reno.py:RenoCongestion.on_timeout, tcp_connection.py:choose_mss'}
+    REASON = 'extra: we need it for this reason'
 
     def setUp(self):
-        """Build streaprous/ with one tcp module and one teacher module."""
+        """Build a fake repository: tcp modules, a teacher module and a valid document."""
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
         sock = os.path.join(self.root, 'streaprous', 'streaprous_socket')
         os.makedirs(sock)
-        self.write(os.path.join(sock, 'tcp_demo.py'),
-                   '"""Demo."""\n\n\ndef do_thing():\n    """Slide 3-88."""\n\n\n'
-                   'class Box:\n    def __init__(self):\n        pass\n\n'
-                   '    def open_it(self):\n        pass\n')
+        self.write(os.path.join(sock, 'tcp_sender.py'),
+                   'class TcpSender:\n    def send_data(self):\n        pass\n')
+        self.write(os.path.join(sock, 'tcp_receiver.py'),
+                   'class TcpReceiver:\n    def rwnd(self):\n        pass\n')
+        self.write(os.path.join(sock, 'tcp_reno.py'),
+                   'class RenoCongestion:\n    def on_timeout(self):\n        pass\n')
+        self.write(os.path.join(sock, 'tcp_connection.py'),
+                   '"""Slide 3-88."""\n\n\ndef choose_mss():\n    pass\n')
         self.write(os.path.join(sock, 'teacher.py'),
                    'def accept():\n    x = 1\n    y = 2  # TEAM: hook\n    return x + y\n')
-        self.write(os.path.join(self.root, 'streaprous', 'top.py'),
-                   'import os  # TEAM: import\n')
         self.doc = os.path.join(self.root, 'doc.md')
+        self.text = self.valid_doc()
+        self.write(self.doc, self.text)
 
     def write(self, path, text):
         """Write a text file."""
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write(text)
 
-    def test_required_functions(self):
-        """Special methods are not required; read_request_raw always is."""
-        self.assertEqual(check_walkthrough.required_functions(self.root),
-                         ['do_thing', 'open_it', 'read_request_raw'])
+    def row(self, slides, words, function, mark):
+        """Return one table row."""
+        return '| %s | %s | %s | %s |' % (slides, words, function, mark)
+
+    def pair_section(self, pair, title):
+        """Return the lines of one pair section built from RULES and EXTRAS."""
+        out = ['## ' + title, '', '### Slide rules', '',
+               "| Slide | The slide's words | Our function | Mark |",
+               '| --- | --- | --- | --- |']
+        for rule_pair, slides, quote in check_walkthrough.RULES:
+            if rule_pair == pair:
+                out.append(self.row(slides, quote, self.FILES[pair], 'as the slide'))
+        for extra_pair, key in check_walkthrough.EXTRAS:
+            if extra_pair == pair:
+                out.append(self.row('extra', key, self.FILES[pair], self.REASON))
+        out += ['', '### Traced example', '', 'cwnd goes 1, 2, 4.', '',
+                '### Known limits', '', '- One limit. Answer: we keep it.', '',
+                '### Questions to expect', '']
+        for number in range(4):
+            out += ['Q: question %d?' % number, 'A: answer %d.' % number]
+        out += ['', '### Self-check', '', '1. First? Short.', '2. Second? Short.',
+                '3. Third? Short.', '']
+        return out
+
+    def valid_doc(self):
+        """Return a minimal document that passes every check."""
+        out = ['## Before you start', '', 'Words: byte stream, segment.', '',
+               '    python -m unittest discover -s streaprous/tests -t streaprous',
+               '    python streaprous/docker/lab.py test', '']
+        out += self.pair_section('R', 'Reliable data transfer')
+        out += self.pair_section('F', 'Flow control')
+        out += self.pair_section('C', 'Congestion control')
+        out += ["## Our hooks in the teacher's files", '', '| Function | Hook |',
+                '| --- | --- |', '| `accept` | one line |', '',
+                '## Background', '', 'RFC 6298 sets the minimum timeout.', '']
+        return '\n'.join(out)
+
+    def problems_for(self, text):
+        """Write text as the document and return the problems found."""
+        self.write(self.doc, text)
+        return check_walkthrough.check(self.root, self.doc)
+
+    def assert_problem(self, text, expected):
+        """Assert that the mutated document gets a problem containing expected."""
+        problems = self.problems_for(text)
+        self.assertTrue(any(expected in p for p in problems),
+                        '%r not found in %r' % (expected, problems))
+
+    def mutate(self, old, new, count=1):
+        """Return the valid text with old replaced by new."""
+        self.assertIn(old, self.text)
+        return self.text.replace(old, new, count)
+
+    def test_tables(self):
+        """The tables hold 20 rules and 12 extras."""
+        self.assertEqual(len(check_walkthrough.RULES), 20)
+        self.assertEqual(len(check_walkthrough.EXTRAS), 12)
+
+    def test_valid_document(self):
+        """The valid document passes, also through main."""
+        self.assertEqual(self.problems_for(self.text), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = check_walkthrough.main(['--root', self.root, '--doc', self.doc])
+        self.assertEqual(code, 0)
+        self.assertIn('OK: walkthrough shape, 20 slide rules, 12 extras', out.getvalue())
+
+    def test_main_fails(self):
+        """main prints FAIL and returns 1 on a bad document."""
+        self.write(self.doc, self.text + 'demo\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = check_walkthrough.main(['--root', self.root, '--doc', self.doc])
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL', out.getvalue())
+
+    def test_normalize(self):
+        """Normalization keeps only a-z 0-9 # + * / = < > ( ) - after lowercasing."""
+        self.assertEqual(check_walkthrough.normalize('A b, "c" \\| 3-1 (x)*y.'), 'abc3-1(x)*y')
+
+    def test_1_too_long(self):
+        """Check 1: more than 600 lines."""
+        self.assert_problem(self.text + '\nx' * 600, 'more than 600')
+
+    def test_2_headings(self):
+        """Check 2: a wrong ## heading, and a missing or misplaced ### subsection."""
+        self.assert_problem(self.mutate('## Flow control', '## Flow'), 'the ## headings')
+        self.assert_problem(self.mutate('### Self-check', '### Review'), '### subsections')
+        self.assert_problem(self.mutate('### Traced example', '### Known limits'),
+                            '### subsections')
+
+    def test_3_table_header(self):
+        """Check 3: the table header is missing."""
+        self.assert_problem(self.mutate('| Our function |', '| Function |'), 'no table')
+
+    def test_4_canonical_rules(self):
+        """Check 4: words changed, slide missing, wrong mark, rule twice."""
+        self.assert_problem(self.mutate('ignore retransmissions', 'ignore all'),
+                            'canonical rule for 3-81')
+        self.assert_problem(self.mutate('| 3-86, 3-87 |', '| 3-86 |'), 'lacks slide 3-87')
+        row = self.row('3-122', 'LastByteSent - LastByteAcked <= cwnd', self.FILES['C'],
+                       'as the slide')
+        wrong = self.row('3-122', 'LastByteSent - LastByteAcked <= cwnd', self.FILES['C'],
+                         self.REASON)
+        self.assert_problem(self.mutate(row, wrong), 'not marked')
+        self.assert_problem(self.mutate(row, row + '\n' + row), 'matches 2 rows')
+
+    def test_5_extras(self):
+        """Check 5: extra key missing, twice, or with a short reason."""
+        row = self.row('extra', 'round down', self.FILES['C'], self.REASON)
+        self.assert_problem(self.mutate(row, ''), 'extra key "round down"')
+        self.assert_problem(self.mutate('| ' + self.REASON + ' |', '| extra: why |'),
+                            'fewer than 5 words')
+        self.assert_problem(self.mutate(row, row + '\n' + row), 'is in 2 extra rows')
+
+    def test_6_marks(self):
+        """Check 6: unknown mark and the word differs."""
+        self.assert_problem(self.mutate('| as the slide |', '| roughly |'), 'neither')
+        self.assert_problem(self.mutate('| as the slide |', '| differs from the slide |'),
+                            'differs')
+
+    def test_7_function_cells(self):
+        """Check 7: unknown method, unknown file, bad item."""
+        for bad in ('tcp_sender.py:TcpSender.nope', 'tcp_missing.py:Thing', 'just words'):
+            self.assert_problem(self.mutate(self.FILES['R'], bad), 'does not exist')
+
+    def test_8_known_limits(self):
+        """Check 8: no bullet, or a bullet without Answer:."""
+        self.assert_problem(self.mutate('Answer: we keep it.', 'We keep it.'), 'no Answer')
+        self.assert_problem(self.mutate('- One limit. Answer: we keep it.', 'One limit.'),
+                            'no "- " bullet')
+
+    def test_9_questions(self):
+        """Check 9: too few Q lines, or a Q without A."""
+        self.assert_problem(self.mutate('Q: question 3?\nA: answer 3.\n', ''), 'at least 4')
+        self.assert_problem(self.mutate('A: answer 0.', 'answer 0.'), 'no A: line')
+
+    def test_10_self_check(self):
+        """Check 10: fewer than 3 numbered items."""
+        self.assert_problem(self.mutate('3. Third? Short.', 'Third? Short.'),
+                            'Self-check has 2')
+
+    def test_11_slide_map(self):
+        """Check 11: a slide outside the map, in the document and in a module."""
+        self.assert_problem(self.mutate('cwnd goes', 'slide 3-89, cwnd goes'),
+                            'slide 3-89 in the document')
+        inside = self.mutate('cwnd goes', 'slides 3-146 and 3-101, cwnd goes')
+        self.assertEqual(self.problems_for(inside), [])
+        path = os.path.join(self.root, 'streaprous', 'streaprous_socket', 'tcp_reno.py')
+        self.write(path, '"""Slide 3-126."""\n')
+        self.assert_problem(self.text, 'slide 3-126 in tcp_reno.py')
 
     @NEEDS_38
-    def test_complete_doc(self):
-        """A document naming everything passes."""
-        self.write(self.doc, 'do_thing open_it read_request_raw accept top.py slide 3-88')
-        self.assertEqual(check_walkthrough.check(self.root, self.doc), [])
+    def test_12_team_function(self):
+        """Check 12: a teacher function with a TEAM line is not named."""
+        self.assert_problem(self.mutate('`accept`', '`other`'), 'teacher change accept')
 
-    @NEEDS_38
-    def test_missing_names_and_bad_slide(self):
-        """Missing names and a slide outside the map are reported."""
-        self.write(self.doc, 'do_thing open_it slide 3-89')
-        problems = check_walkthrough.check(self.root, self.doc)
-        text = '\n'.join(problems)
-        self.assertIn('read_request_raw', text)
-        self.assertIn('accept', text)
-        self.assertIn('top.py', text)
-        self.assertIn('3-89', text)
-        self.assertEqual(len(problems), 4)
+    def test_13_test_commands(self):
+        """Check 13: each test command is needed."""
+        self.assert_problem(self.mutate('python streaprous/docker/lab.py test', 'x'),
+                            'test command is missing')
+        self.assert_problem(self.mutate('python -m unittest discover -s streaprous/tests '
+                                        '-t streaprous', 'x'), 'test command is missing')
 
-    def test_bad_slide_in_module(self):
-        """A slide outside the map in a tcp module is reported."""
-        self.write(os.path.join(self.root, 'streaprous', 'streaprous_socket', 'tcp_demo.py'),
-                   '"""Demo 3-89."""\n')
-        self.write(os.path.join(self.root, 'streaprous', 'streaprous_socket', 'teacher.py'),
-                   'x = 1\n')
-        self.write(os.path.join(self.root, 'streaprous', 'top.py'), 'y = 1\n')
-        self.write(self.doc, 'read_request_raw')
-        problems = check_walkthrough.check(self.root, self.doc)
-        self.assertEqual(len(problems), 1)
-        self.assertIn('3-89', problems[0])
+    def test_14_demo(self):
+        """Check 14: demo and rehearsal words."""
+        self.assert_problem(self.text + '\nRun the Demo.\n', 'demo or rehearsal')
+        self.assert_problem(self.text + '\nthe rehearsal\n', 'demo or rehearsal')
+
+    def test_15_outside_sources(self):
+        """Check 15: outside sources only under Background, or flagged as background."""
+        self.assert_problem(self.mutate('Words: byte', 'RFC 793 says. Words: byte'),
+                            'without saying background')
+        ok = self.mutate('Words: byte', 'RFC 793, see Background. Words: byte')
+        self.assertEqual(self.problems_for(ok), [])
 
 
 if __name__ == '__main__':
