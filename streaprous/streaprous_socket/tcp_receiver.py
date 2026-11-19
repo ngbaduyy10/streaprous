@@ -35,6 +35,10 @@ class TcpReceiver:
         """
         self.rcv_nxt = rcv_nxt
         self.buffer_size = buffer_size
+        # Book 3.5.4: an in-order segment may wait up to 500 ms for another
+        # one before an ACK is sent. I use a shorter wait (config:
+        # delayed_ack = 0.1 s) so transfers and demos are quicker. It is
+        # well below the 500 ms limit of RFC 5681.
         self.delayed_ack = delayed_ack
         self.on_event = on_event or (lambda name, **details: None)
         self.ready = bytearray()
@@ -68,6 +72,13 @@ class TcpReceiver:
             'duplicate', 'gap_filled', 'fin', 'old_segment',
             'out_of_window', 'probe'), or None when no ACK is needed yet.
         """
+        # ACK generation follows the table in book 3.5.4 (RFC 5681):
+        # in-order segment, nothing pending -> wait (delayed ACK);
+        # in-order segment, ACK pending -> send one cumulative ACK now;
+        # segment above the expected number (a gap) -> send a duplicate ACK
+        # at once; segment that fills a gap -> ACK at once.
+        # The duplicate ACKs are exactly what the sender's fast retransmit
+        # (book 3.5.4) and Reno (3.7.1) depend on.
         payload = bytes(payload)
         if not payload and not fin:
             # Pure ACK, or a zero-window probe / keepalive below rcv_nxt
@@ -94,6 +105,11 @@ class TcpReceiver:
         if not payload and not fin:
             return 'out_of_window'
 
+        # The book (3.5.4) notes that the RFCs do not say what a receiver
+        # must do with out-of-order segments. Real implementations buffer
+        # them, as I do. WHY: then only the missing segment needs to be
+        # resent (not everything after it, as in Go-Back-N), and the sender
+        # gets the duplicate ACKs that trigger fast retransmit.
         if seq > self.rcv_nxt:
             if payload:
                 self._store_out_of_order(seq, payload)
@@ -215,6 +231,10 @@ class TcpReceiver:
         Returns:
             int: Free space in bytes, between 0 and ``buffer_size``.
         """
+        # Book 3.5.5, exactly: rwnd = RcvBuffer - [LastByteRcvd -
+        # LastByteRead]. The bytes the application has not read yet take up
+        # space. Out-of-order bytes are not counted separately: they sit
+        # inside the advertised space.
         free = self.buffer_size - (self.last_byte_rcvd - self.last_byte_read)
         return max(0, min(self.buffer_size, free))
 
@@ -229,6 +249,11 @@ class TcpReceiver:
         Returns:
             bool: True when an ACK with the new window should go out.
         """
+        # Not in the book. After rwnd was small or 0, the receiver sends a
+        # window update once a quarter of the buffer is free again. WHY: the
+        # book (3.5.5) shows that a sender stalled on rwnd = 0 only learns
+        # about new room from an ACK, so we send one instead of waiting for
+        # a probe.
         quarter = self.buffer_size // 4
         return self.last_advertised < quarter <= self.window()
 

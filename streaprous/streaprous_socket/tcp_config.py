@@ -108,10 +108,24 @@ def load_settings(environ):
     else:
         loss_seed = seed_text
     return types.SimpleNamespace(
+        # MSS 1460 = 1500 bytes Ethernet MTU - 20 IP header - 20 TCP header.
+        # The book (3.5.1) gives 1460 as a typical MSS. 536 is the minimum
+        # a host must accept when the peer does not say (default_peer_mss).
         mss_limit=_read_int(environ, 'STREAPROUS_MSS', 1460, 536, 1460),
         default_peer_mss=536,
+        # RcvBuffer for flow control (book 3.5.5). Upper limit 65535 because
+        # the receive window field in the TCP header is 16 bits (book 3.5.2).
         recv_buffer=_read_int(environ, 'STREAPROUS_RCVBUF', 32768, 1, 65535),
-        initial_ssthresh=_read_int(environ, 'STREAPROUS_SSTHRESH', 32768, 1, 10 ** 9),
+        # _read_int(env, name, default, min, max) reads an integer setting.
+        # 10 ** 9 is 10 to the power 9, the upper limit. First ssthresh is
+        # 65536 bytes (64 KB, slide 3-125; about 45 MSS at MSS 1460) unless
+        # STREAPROUS_SSTHRESH is set. Below it cwnd grows in slow start;
+        # above it, growth becomes congestion avoidance (book 3.7.1).
+        initial_ssthresh=_read_int(environ, 'STREAPROUS_SSTHRESH', 65536, 1, 10 ** 9),
+        # initial_rto: 1 second before any RTT sample (book 3.5.3).
+        # min_rto / max_rto: practical limits on TimeoutInterval, not from
+        # the book. max_retries: timeouts in a row before we give up, also
+        # a practical choice.
         initial_rto=1.0,
         min_rto=0.2,
         max_rto=4.0,
@@ -151,7 +165,7 @@ def describe(settings):
          settings  object returned by load_settings
 
     Returns:
-         text such as "mss_limit=1460 rcvbuf=32768 ssthresh=32768 drop_send=3,60 loss=0.0 ..."
+         text such as "mss_limit=1460 rcvbuf=32768 ssthresh=65536 drop_send=3,60 loss=0.0 ..."
     """
     return ' '.join([
         'mss_limit=%d' % settings.mss_limit,

@@ -176,6 +176,17 @@ class RenoTableTest(unittest.TestCase):
         self.assertEqual(reno.dup_ack_count, 0)
         self.assertEqual(reno.state, SLOW_START)
 
+    def test_book_figure_3_52_triple_duplicate_ack(self):
+        cc = RenoCongestion(1000, 6000)
+        cc.cwnd = 12000
+        cc.state = CONGESTION_AVOIDANCE
+        cc.on_duplicate_ack()
+        cc.on_duplicate_ack()
+        self.assertTrue(cc.on_duplicate_ack())
+        self.assertEqual(cc.ssthresh, 6000)   # 0.5 * 12 MSS
+        self.assertEqual(cc.cwnd, 9000)       # ssthresh + 3 MSS, som i figuren
+        self.assertEqual(cc.state, FAST_RECOVERY)
+
 
 class RenoEventTest(unittest.TestCase):
 

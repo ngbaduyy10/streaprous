@@ -333,8 +333,8 @@ sender                                   receiver
 ### 2.5 The mechanism, traced on the real loss demo
 
 The loss demo drops the 3rd and the 60th new data segment we send (`STREAPROUS_DROP_SEND=3,60`). Below
-are the first rows of its CSV trace (`out/loss/trace_172.28.0.20_52864.csv`). Our first byte is 2001,
-MSS 1460, initial RTO 1 s, ssthresh 32768.
+are the first rows of its saved CSV trace (`out/loss/trace_172.28.0.20_52864.csv`), captured with
+`ssthresh=32768` before the default changed to 65536. Our first byte is 2001, MSS 1460, initial RTO 1 s.
 
 ```text
 time,  event,   cwnd, ssthresh, rwnd,  in_flight, snd_una, snd_nxt
@@ -806,7 +806,7 @@ also draws `out/slow-app/window.svg`, our advertised window over time. The check
 | --- | --- |
 | `tcp_reno.py` | `RenoCongestion.on_new_ack`, `RenoCongestion.on_duplicate_ack`, `RenoCongestion.on_timeout`, `RenoCongestion._set_state`, `RenoCongestion._halve_ssthresh` |
 | `tcp_sender.py` | `TcpSender._usable_window` and `TcpSender._send_allowed` (use cwnd), `TcpSender._on_new_ack` (calls `cc.on_new_ack`), `TcpSender._on_duplicate_ack` (calls `cc.on_duplicate_ack`), `TcpSender._fast_retransmit`, `TcpSender._on_timeout` (calls `cc.on_timeout`) |
-| `tcp_config.py` | `initial_ssthresh` (`STREAPROUS_SSTHRESH`, default 32768) |
+| `tcp_config.py` | `initial_ssthresh` (`STREAPROUS_SSTHRESH`, default 65536) |
 | `tools/plot_trace.py` | draws cwnd, ssthresh and rwnd from the CSV trace |
 
 ### 4.2 Slides it implements
@@ -846,8 +846,8 @@ Because the rate is about `cwnd / RTT` (slide 3-122), changing cwnd changes how 
 
 - **cwnd** (slide 3-122). The congestion window in bytes. It starts at 1 MSS = 1460 (slide 3-123).
 - **ssthresh** (slide 3-124). The slow start threshold: below it cwnd grows fast, above it slowly. It
-  starts at 32768 (half of the slide's 64 KB, so that against the client's 64 KB window the chart shows
-  the change from slow start to congestion avoidance).
+  starts at 65536 bytes (64 KB, as shown on slide 3-125); `STREAPROUS_SSTHRESH` can override it for a
+  demo.
 - **Slow start** (slide 3-123). +1 MSS per new ACK, so cwnd doubles every RTT. "Slow" means it starts
   small, not that it grows slowly.
 - **Congestion avoidance** (slide 3-125). +MSS·(MSS/cwnd) per new ACK, about +1 MSS per RTT. In integer
@@ -873,14 +873,17 @@ of its three methods for each event:
 Every new ACK also sets `dup_ack_count = 0`. `_halve_ssthresh` never lets ssthresh go below 2 MSS
 (**Background**, RFC 5681). `_set_state` logs a `STATE` line on every change.
 
-**Slow start** (MSS 1460, ssthresh 32768). One new ACK at a time:
+**Slow start** (MSS 1460, ssthresh 65536). One new ACK at a time:
 
 ```text
-cwnd 1460 -> 2920 -> 4380 -> ... -> 32120 (22 MSS, still <= 32768: slow start)
-     -> 33580 (23 MSS > 32768) -> STATE old=SLOW_START new=CONGESTION_AVOIDANCE
+cwnd 1460 -> 2920 -> 4380 -> ... -> 64240 (44 MSS, still <= 65536: slow start)
+     -> 65700 (45 MSS > 65536) -> STATE old=SLOW_START new=CONGESTION_AVOIDANCE
 ```
 
-The real line from the trace demo:
+The following saved trace snippets in sections 4.5-4.8 were captured with the previous default,
+`ssthresh=32768`; their runtime values are historical, not output from the current default. Re-run demo c
+before presenting current demo numbers, or set `STREAPROUS_SSTHRESH=32768` to reproduce the old run.
+The real line from that earlier trace:
 
 ```text
 [Streap_tcp] 172.28.0.20:40434 STATE old=SLOW_START new=CONGESTION_AVOIDANCE | cwnd=33580 ssthresh=32768 rwnd=65535 flight=30660 adv=32768

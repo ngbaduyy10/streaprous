@@ -89,7 +89,7 @@ def test_streams_are_independent():
     """A stalled file stream must not block chat on stream 0 (no head-of-line blocking)."""
 
     async def main():
-        a, b, ca, cb, _ = await _link()
+        a, b, ca, cb, _ = await _link(TransportConfig(initial_cwnd=10))
         order = []
         cb.on_message = lambda _c, _t, sid, payload: order.append(payload)
         stream = ca.open_stream()

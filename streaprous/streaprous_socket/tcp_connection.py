@@ -93,6 +93,13 @@ class TcpConnection:
                                     'trace_%s_%d.csv' % (self.client_ip, self.client_port))
         self.trace = TcpTrace(self.name, settings.log_level, csv_path, clock=clock)
         self.rtt = RttEstimator(settings.initial_rto, settings.min_rto, settings.max_rto)
+        # One RenoCongestion per TCP connection. The book (3.7.1, 3.7.3)
+        # describes congestion control per connection: each connection
+        # probes the path with its own cwnd, and AIMD makes connections that
+        # share a bottleneck converge to about equal shares. So a loss on
+        # one connection does not slow down another.
+        # RenoCongestion(...) calls the constructor __init__. The arguments
+        # go in the order it expects them: MSS, initial ssthresh, logger.
         self.cc = RenoCongestion(self.mss, settings.initial_ssthresh, self._on_event)
         self.sender = TcpSender(self.iss, self.mss, rwnd, self.rtt, self.cc,
                                 settings.max_retries, settings.persist_min,
