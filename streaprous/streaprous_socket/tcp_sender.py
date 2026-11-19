@@ -162,8 +162,10 @@ class TcpSender:
             self._on_new_ack(ack, window, now)
             return self._send_allowed(now)
         # An ACK that only opens rwnd is flow control, not a loss (book 3.5.5).
-        duplicate = (self.snd_nxt > self.snd_una and not has_data
-                     and window == self.rwnd)
+        data_is_out = self.snd_nxt > self.snd_una
+        no_payload = not has_data
+        window_unchanged = window == self.rwnd
+        duplicate = data_is_out and no_payload and window_unchanged
         self._update_rwnd(window)
         if duplicate:
             return self._on_duplicate_ack(now)
@@ -252,7 +254,10 @@ class TcpSender:
             when a window shrank.
         """
         # cwnd is the network, rwnd the receiver. Zero or less means wait (book 3.7.1).
-        return min(self.cc.cwnd, self.rwnd) - self.bytes_in_flight()
+        network_limit = self.cc.cwnd
+        receiver_limit = self.rwnd
+        allowed = min(network_limit, receiver_limit)
+        return allowed - self.bytes_in_flight()
 
     def _send_allowed(self, now):
         """
@@ -437,6 +442,7 @@ class TcpSender:
         self.timeouts += 1
         # back_off doubles the wait. on_timeout drops cwnd to 1 MSS (slide 3-124).
         self.rtt.back_off()
+        # Reno halves ssthresh and sets cwnd back to one MSS.
         self.cc.on_timeout()
         # Karn's rule (book 3.5.3): don't time the retransmitted copy.
         self._cancel_rtt_timing()
@@ -476,6 +482,7 @@ class TcpSender:
         self._update_rwnd(window)
         self._take_rtt_sample(ack, now)
         self.timeouts_in_row = 0
+        # Reno grows cwnd, or leaves fast recovery, because new bytes were acknowledged.
         self.cc.on_new_ack()
         if self.snd_una < self.snd_nxt:
             self._start_timer(now)
@@ -497,7 +504,7 @@ class TcpSender:
         Returns:
             list: SendSegment values to transmit now.
         """
-        # True only on the third duplicate ACK: that is the fast retransmit (book 3.5.4).
+        # Reno returns True only on the third duplicate ACK, the fast retransmit (book 3.5.4).
         retransmit_now = self.cc.on_duplicate_ack()
         self.on_event('DUPACK', ack=self.snd_una, count=self.cc.dup_ack_count)
         out = []

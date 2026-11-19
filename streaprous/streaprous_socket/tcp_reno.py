@@ -59,8 +59,10 @@ class RenoCongestion:
         The floor of 2 MSS comes from RFC 5681, not from the slides. Without
         it a tiny cwnd would give a tiny ssthresh and slow start could not grow.
         """
-        # Half of cwnd (book 3.7.1, slide 3-125). The floor of 2 MSS is RFC 5681, not the book.
-        self.ssthresh = max(self.cwnd // 2, 2 * self.mss)
+        # Half of cwnd, but never below 2 MSS (RFC 5681, not the book).
+        half_window = self.cwnd // 2
+        floor = 2 * self.mss
+        self.ssthresh = max(half_window, floor)
 
     def on_new_ack(self):
         """Handles an ACK that acknowledges new data (slides 3-123, 3-125).
@@ -76,15 +78,20 @@ class RenoCongestion:
         """
         self.dup_ack_count = 0
         if self.state == SLOW_START:
-            # +1 MSS per ACK, so the window doubles each RTT.
-            self.cwnd += self.mss
+            # One MSS per ACK, so the window doubles each round trip.
+            one_segment = self.mss
+            self.cwnd = self.cwnd + one_segment
             # The book says slow start ends when cwnd reaches ssthresh.
             # Slide 3-125 writes cwnd > ssthresh, so equal stays in slow start.
-            if self.cwnd > self.ssthresh:
+            passed_threshold = self.cwnd > self.ssthresh
+            if passed_threshold:
                 self._set_state(CONGESTION_AVOIDANCE)
         elif self.state == CONGESTION_AVOIDANCE:
-            # MSS*MSS/cwnd per ACK is about 1 MSS per RTT. max(1, ...) so a huge window still grows.
-            self.cwnd += max(1, self.mss * self.mss // self.cwnd)
+            # About 1 MSS per round trip. At least 1 byte, so a huge window still grows.
+            growth = self.mss * self.mss // self.cwnd
+            if growth < 1:
+                growth = 1
+            self.cwnd = self.cwnd + growth
         else:
             # The lost segment arrived. Drop cwnd back to ssthresh.
             self.cwnd = self.ssthresh
@@ -106,13 +113,16 @@ class RenoCongestion:
         """
         if self.state == FAST_RECOVERY:
             # One more segment has left the network, so there is room for one more.
-            self.cwnd += self.mss
+            one_segment = self.mss
+            self.cwnd = self.cwnd + one_segment
             return False
         self.dup_ack_count += 1
-        if self.dup_ack_count == 3:
+        third_duplicate = self.dup_ack_count == 3
+        if third_duplicate:
             # Fast retransmit (book 3.5.4). The 3 MSS are already at the receiver (slide 3-125).
             self._halve_ssthresh()
-            self.cwnd = self.ssthresh + 3 * self.mss
+            three_segments = 3 * self.mss
+            self.cwnd = self.ssthresh + three_segments
             self._set_state(FAST_RECOVERY)
             return True
         return False
@@ -127,6 +137,7 @@ class RenoCongestion:
         """
         # Harder than 3 duplicate ACKs: nothing came back, so cwnd drops to 1 MSS (slides 3-121, 3-124).
         self._halve_ssthresh()
-        self.cwnd = self.mss
+        one_segment = self.mss
+        self.cwnd = one_segment
         self.dup_ack_count = 0
         self._set_state(SLOW_START)
