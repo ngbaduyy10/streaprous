@@ -285,16 +285,21 @@ class FlowControlTransferTest(TransferTestCase):
         return Reader(chunk=1024, interval=0.05, pause_after=16384, pause=2.0)
 
     def test_slow_reader(self):
-        """The window reaches 0, the sender probes, and sending resumes."""
+        """The window reaches 0, the sender probes every 0.5 s, and sending resumes."""
         data = data_of(65536)
         result = self.run_checked(data, mss=536, rcvbuf=4096, reader=self.slow_reader())
         sender_names = names(result.sender_events)
         for name in ('RWND_ZERO', 'PROBE', 'RWND_OPEN'):
             self.assertIn(name, sender_names)
-        zero = of_name(result.sender_events, 'RWND_ZERO')[0]
+        zeros = [e.time for e in of_name(result.sender_events, 'RWND_ZERO')]
+        opens = [e.time for e in of_name(result.sender_events, 'RWND_OPEN')]
         probes = of_name(result.sender_events, 'PROBE')
         self.assertTrue(all(p.state['rwnd'] == 0 and p.state['in_flight'] == 0 for p in probes))
-        self.assertAlmostEqual(probes[0].time - zero.time, 0.2)
+        closed_at = max(t for t in zeros if t <= probes[0].time)
+        self.assertGreaterEqual(probes[0].time - closed_at, 0.5 - 1e-9)
+        for earlier, later in zip(probes, probes[1:]):
+            if not any(earlier.time < t < later.time for t in opens):
+                self.assertAlmostEqual(later.time - earlier.time, 0.5)
         last_probe = max(i for i, name in enumerate(sender_names) if name == 'PROBE')
         self.assertIn('SEND', sender_names[last_probe:])
         windows = [e.details['window'] for e in of_name(result.receiver_events, 'ACK_SENT')]
@@ -319,7 +324,6 @@ class FlowControlTransferTest(TransferTestCase):
         drop_time, ack = dropped[0]
         self.assertEqual(ack.reason, 'window_update')
         opens = of_name(result.sender_events, 'RWND_OPEN')
-        self.assertEqual(len(opens), 1)
         self.assertGreater(opens[0].time, drop_time)
         later_probes = [p for p in of_name(result.sender_events, 'PROBE')
                         if drop_time < p.time < opens[0].time]

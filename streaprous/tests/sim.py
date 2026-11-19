@@ -240,7 +240,7 @@ class Reader:
             to read (reading everything at once).
         """
         if self.chunk is None:
-            return now if receiver.ready else None
+            return now if receiver.buffered_data else None
         return self.due
 
     def read(self, receiver, now):
@@ -273,7 +273,7 @@ class Simulation:
 
     The endpoint glue does what the connection will do: every segment the
     sender returns goes on the data link; on the receiving side an ACK
-    ``(ack=receiver.rcv_nxt, window=receiver.window())`` goes on the ACK
+    ``(ack=receiver.rcv_nxt, window=receiver.rwnd())`` goes on the ACK
     link whenever ``on_segment`` or ``on_tick`` gives a reason, and after
     the application reads when ``window_update_due()`` holds. ACKs carry
     no data. With ``close`` the sender closes once its data is ACKed.
@@ -295,15 +295,12 @@ class Simulation:
         min_rto: Smallest timeout.
         max_rto: Largest timeout.
         max_retries: Timeouts in a row before the sender gives up.
-        persist_min: First zero-window probe interval.
-        persist_max: Largest zero-window probe interval.
     """
 
     def __init__(self, data, mss=1460, rcvbuf=32768, ssthresh=32768, delay=0.01,
                  data_link=None, ack_link=None, reader=None, close=False,
                  time_limit=120.0, iss=1000, delayed_ack=0.1, initial_rto=1.0,
-                 min_rto=0.2, max_rto=4.0, max_retries=8, persist_min=0.2,
-                 persist_max=2.0):
+                 min_rto=0.2, max_rto=4.0, max_retries=8):
         """
         Build both endpoints and both links.
 
@@ -324,8 +321,6 @@ class Simulation:
             min_rto: Smallest timeout.
             max_rto: Largest timeout.
             max_retries: Timeouts in a row before giving up.
-            persist_min: First zero-window probe interval.
-            persist_max: Largest zero-window probe interval.
         """
         self.data = bytes(data)
         self.close = close
@@ -340,8 +335,8 @@ class Simulation:
 
         rtt = RttEstimator(initial_rto, min_rto, max_rto)
         cc = RenoCongestion(mss, ssthresh, self._sender_event)
-        self.sender = TcpSender(iss, mss, rcvbuf, rtt, cc, max_retries, persist_min,
-                                persist_max, self._sender_event)
+        self.sender = TcpSender(iss, mss, rcvbuf, rtt, cc, max_retries,
+                                self._sender_event)
         self.receiver = TcpReceiver(iss, rcvbuf, delayed_ack, self._receiver_event)
 
     # ------------------------------------------------------------------
@@ -369,7 +364,7 @@ class Simulation:
         """
         rx = self.receiver
         held = sum(len(part) for part in rx.out_of_order.values())
-        return {'rcv_nxt': rx.rcv_nxt, 'window': rx.window(), 'ready': len(rx.ready),
+        return {'rcv_nxt': rx.rcv_nxt, 'window': rx.rwnd(), 'ready': len(rx.buffered_data),
                 'out_of_order': held, 'fin_received': rx.fin_received}
 
     def _sender_event(self, name, **details):
@@ -418,7 +413,7 @@ class Simulation:
             reason: Why the ACK goes out ('delayed', 'duplicate', 'window_update', ...).
         """
         rx = self.receiver
-        window = rx.window()
+        window = rx.rwnd()
         packet = Packet(None, b"", False, 'ack', rx.rcv_nxt, window, reason)
         self.ack_link.send(packet, self.clock.now)
         rx.ack_sent(window)
@@ -438,7 +433,7 @@ class Simulation:
         self._transmit(self.sender.on_ack(packet.ack, packet.window, False, self.clock.now))
 
     def _on_sender_timer(self):
-        """Run the sender's retransmission and persist timers."""
+        """Run the sender's retransmission and probe timers."""
         self._transmit(self.sender.on_tick(self.clock.now))
 
     def _on_receiver_timer(self):
@@ -510,7 +505,7 @@ class Simulation:
             '%s at t=%.3f: delivered %d of %d, snd_una=%d snd_nxt=%d rwnd=%d cwnd=%d '
             'rcv_nxt=%d window=%d timeouts=%d'
             % (why, self.clock.now, len(self.delivered), len(self.data), tx.snd_una,
-               tx.snd_nxt, tx.rwnd, tx.cc.cwnd, rx.rcv_nxt, rx.window(), tx.timeouts))
+               tx.snd_nxt, tx.rwnd, tx.cc.cwnd, rx.rcv_nxt, rx.rwnd(), tx.timeouts))
 
     def run(self):
         """

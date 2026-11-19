@@ -43,7 +43,7 @@ def make(rwnd=BIG, cwnd=None, ssthresh=BIG, max_retries=8):
     cc = RenoCongestion(MSS, ssthresh, on_event)
     if cwnd is not None:
         cc.cwnd = cwnd
-    tx = TcpSender(ISS, MSS, rwnd, rtt, cc, max_retries, 0.2, 2.0, on_event)
+    tx = TcpSender(ISS, MSS, rwnd, rtt, cc, max_retries, on_event)
     holder.append(tx)
     return tx, events
 
@@ -515,16 +515,17 @@ class WindowLimitTest(unittest.TestCase):
 
 
 class SmallSegmentTest(unittest.TestCase):
-    """A segment shorter than one MSS waits while data is in flight."""
+    """Each segment is at most one MSS and at most the room left (slide 3-122)."""
 
-    def test_no_small_segment_while_in_flight(self):
-        """Window room below one MSS is not used while ACKs are still coming."""
+    def test_room_below_mss_used_while_in_flight(self):
+        """Room below one MSS is used at once, even while data is in flight."""
         tx, _ = make(rwnd=250, cwnd=10 * MSS)
         out = tx.write(data_of(1000), 0.0)
-        self.assertEqual([len(s.payload) for s in out], [100, 100])
+        self.assertEqual([len(s.payload) for s in out], [100, 100, 50])
+        self.assertEqual(tx.bytes_in_flight(), 250)
         out = tx.on_ack(ISS + 100, 250, False, 0.1)
-        self.assertEqual([len(s.payload) for s in out], [100])
-        self.assertEqual(tx.bytes_in_flight(), 200)
+        self.assertEqual([(s.seq, len(s.payload)) for s in out], [(ISS + 250, 100)])
+        self.assertEqual(tx.bytes_in_flight(), 250)
 
     def test_last_piece_may_be_small(self):
         """The last piece of data goes out even while data is in flight."""
@@ -554,26 +555,26 @@ class ZeroWindowTest(unittest.TestCase):
         tx, events = make()
         data = data_of(500)
         tx.write(data, 0.0)
-        self.assertIsNone(tx.persist_deadline)
+        self.assertIsNone(tx.probe_deadline)
         tx.on_ack(ISS + 100, 0, False, 0.1)
         return tx, events, data
 
     def test_zero_window_arms_probe(self):
-        """rwnd 0 with nothing in flight arms the probe 0.2 s later."""
+        """rwnd 0 with nothing in flight arms the probe 0.5 s later."""
         tx, events, data = self.zero_after_first()
         self.assertIn('RWND_ZERO', names(events))
         self.assertIsNone(tx.timer_deadline)
-        self.assertAlmostEqual(tx.persist_deadline, 0.3)
-        self.assertEqual(tx.on_tick(0.29), [])
-        out = tx.on_tick(tx.persist_deadline)
+        self.assertAlmostEqual(tx.probe_deadline, 0.6)
+        self.assertEqual(tx.on_tick(0.59), [])
+        out = tx.on_tick(tx.probe_deadline)
         self.assertEqual(out, [SendSegment(ISS + 100, data[100:101], False, 'probe')])
         self.assertEqual(tx.snd_nxt, ISS + 100)
         self.assertEqual(tx.bytes_in_flight(), 0)
         self.assertEqual(tx.probe_seq, ISS + 100)
         self.assertEqual(tx.probes, 1)
 
-    def test_probe_intervals(self):
-        """The interval doubles from 0.2 s up to 2 s."""
+    def test_probe_interval_is_fixed(self):
+        """One probe every 0.5 s while rwnd stays 0."""
         tx, events = make(rwnd=0)
         self.assertEqual(tx.write(data_of(500), 0.0), [])
         times = []
@@ -586,42 +587,40 @@ class ZeroWindowTest(unittest.TestCase):
             times.append(now)
             self.assertEqual(tx.on_ack(ISS, 0, False, now + 0.01), [])
         gaps = [b - a for a, b in zip([0.0] + times, times)]
-        for gap, expected in zip(gaps, [0.2, 0.4, 0.8, 1.6, 2.0, 2.0]):
-            self.assertAlmostEqual(gap, expected)
-        probes = [e[1]['interval'] for e in events if e[0] == 'PROBE']
-        self.assertEqual(probes, [0.2, 0.4, 0.8, 1.6, 2.0, 2.0])
+        for gap in gaps:
+            self.assertAlmostEqual(gap, 0.5)
+        self.assertEqual(names(events).count('PROBE'), 6)
         self.assertEqual(tx.timeouts, 0)
 
     def test_ack_covering_probe_byte(self):
         """An ACK of the probe byte is accepted; probing goes on at the next byte."""
         tx, events, data = self.zero_after_first()
-        tx.on_tick(tx.persist_deadline)
-        deadline = tx.persist_deadline
-        out = tx.on_ack(ISS + 101, 0, False, 0.31)
+        tx.on_tick(tx.probe_deadline)
+        deadline = tx.probe_deadline
+        out = tx.on_ack(ISS + 101, 0, False, 0.61)
         self.assertEqual(out, [])
         self.assertEqual((tx.snd_una, tx.snd_nxt), (ISS + 101, ISS + 101))
         self.assertIsNone(tx.probe_seq)
-        self.assertEqual(tx.persist_deadline, deadline)
+        self.assertEqual(tx.probe_deadline, deadline)
         out = tx.on_tick(deadline)
         self.assertEqual(out, [SendSegment(ISS + 101, data[101:102], False, 'probe')])
 
     def test_window_update_after_acked_probe(self):
         """A window update that repeats the probe byte's ACK is not ignored."""
         tx, events, data = self.zero_after_first()
-        tx.on_tick(tx.persist_deadline)
-        tx.on_ack(ISS + 101, 0, False, 0.31)
-        out = tx.on_ack(ISS + 101, 1000, False, 0.5)
+        tx.on_tick(tx.probe_deadline)
+        tx.on_ack(ISS + 101, 0, False, 0.61)
+        out = tx.on_ack(ISS + 101, 1000, False, 0.7)
         self.assertIn('RWND_OPEN', names(events))
         self.assertEqual(out[0], SendSegment(ISS + 101, data[101:201], False, 'new'))
 
     def test_window_update_resumes_sending(self):
         """A window update stops probing and sends data again."""
         tx, events, data = self.zero_after_first()
-        tx.on_tick(tx.persist_deadline)
-        out = tx.on_ack(ISS + 100, 1000, False, 0.35)
+        tx.on_tick(tx.probe_deadline)
+        out = tx.on_ack(ISS + 100, 1000, False, 0.65)
         self.assertIn('RWND_OPEN', names(events))
-        self.assertIsNone(tx.persist_deadline)
-        self.assertEqual(tx.persist_interval, 0.2)
+        self.assertIsNone(tx.probe_deadline)
         self.assertEqual([(s.seq, s.kind) for s in out], [(ISS + 100, 'new'), (ISS + 200, 'new')])
         self.assertIsNotNone(tx.timer_deadline)
 
@@ -629,16 +628,16 @@ class ZeroWindowTest(unittest.TestCase):
         """The receiver's answer to the next probe opens the window."""
         tx, events, data = self.zero_after_first()
         rx = HandReceiver(ISS + 100)
-        probe = tx.on_tick(tx.persist_deadline)[0]
-        self.assertEqual(tx.on_ack(ISS + 100, 0, False, 0.31), [])   # byte refused
+        probe = tx.on_tick(tx.probe_deadline)[0]
+        self.assertEqual(tx.on_ack(ISS + 100, 0, False, 0.61), [])   # byte refused
         # the receiver reads; its window update to 1000 is lost
         probe = tx.on_tick(tx.next_deadline())[0]
         self.assertEqual(probe.seq, ISS + 100)
         ack = rx.take(probe)
-        out = tx.on_ack(ack, 1000, False, 0.8)
+        out = tx.on_ack(ack, 1000, False, 1.2)
         self.assertEqual(ack, ISS + 101)
         self.assertIn('RWND_OPEN', names(events))
-        self.assertIsNone(tx.persist_deadline)
+        self.assertIsNone(tx.probe_deadline)
         # cwnd is 3 MSS after the two new ACKs
         self.assertEqual([s.seq for s in out], [ISS + 101, ISS + 201, ISS + 301])
         self.assertTrue(all(s.kind == 'new' for s in out))
@@ -649,7 +648,7 @@ class ZeroWindowTest(unittest.TestCase):
         tx.write(data_of(500), 0.0)
         tx.on_ack(ISS + 100, 0, False, 0.1)
         self.assertGreater(tx.bytes_in_flight(), 0)
-        self.assertIsNone(tx.persist_deadline)
+        self.assertIsNone(tx.probe_deadline)
 
 
 class FinTest(unittest.TestCase):

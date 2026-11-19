@@ -113,9 +113,10 @@ def load_settings(environ):
         # a host must accept when the peer does not say (default_peer_mss).
         mss_limit=_read_int(environ, 'STREAPROUS_MSS', 1460, 536, 1460),
         default_peer_mss=536,
-        # RcvBuffer for flow control (book 3.5.5). Upper limit 65535 because
-        # the receive window field in the TCP header is 16 bits (book 3.5.2).
-        recv_buffer=_read_int(environ, 'STREAPROUS_RCVBUF', 32768, 1, 65535),
+        # RcvBuffer for flow control (book 3.5.5): 4096 bytes, slide 3-94's
+        # "typical default". Upper limit 65535 because the receive window
+        # field in the TCP header is 16 bits (book 3.5.2).
+        recv_buffer=_read_int(environ, 'STREAPROUS_RCVBUF', 4096, 1, 65535),
         # _read_int(env, name, default, min, max) reads an integer setting.
         # 10 ** 9 is 10 to the power 9, the upper limit. First ssthresh is
         # 65536 bytes (64 KB, slide 3-125; about 45 MSS at MSS 1460) unless
@@ -131,8 +132,6 @@ def load_settings(environ):
         max_rto=4.0,
         max_retries=8,
         delayed_ack=0.1,
-        persist_min=0.2,
-        persist_max=2.0,
         linger=2.0,
         tick=0.01,
         peer_silence=60.0,
@@ -165,7 +164,7 @@ def describe(settings):
          settings  object returned by load_settings
 
     Returns:
-         text such as "mss_limit=1460 rcvbuf=32768 ssthresh=65536 drop_send=3,60 loss=0.0 ..."
+         text such as "mss_limit=1460 rcvbuf=4096 ssthresh=65536 drop_send=3,60 loss=0.0 ..."
     """
     return ' '.join([
         'mss_limit=%d' % settings.mss_limit,

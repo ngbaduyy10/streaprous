@@ -13,20 +13,20 @@ BUF = 4096
 DELAY = 0.1
 
 
-def make(rcv_nxt=ISN, buffer_size=BUF, delayed_ack=DELAY):
+def make(rcv_nxt=ISN, rcv_buffer=BUF, delayed_ack=DELAY):
     """
     Build a receiver that records its events.
 
     Args:
         rcv_nxt: First expected sequence number.
-        buffer_size: RcvBuffer in bytes.
+        rcv_buffer: RcvBuffer in bytes.
         delayed_ack: Delayed-ACK time in seconds.
 
     Returns:
         tuple: (receiver, list of (name, details) events).
     """
     events = []
-    rx = TcpReceiver(rcv_nxt, buffer_size, delayed_ack,
+    rx = TcpReceiver(rcv_nxt, rcv_buffer, delayed_ack,
                      on_event=lambda name, **d: events.append((name, d)))
     return rx, events
 
@@ -69,11 +69,11 @@ class AckRuleTests(unittest.TestCase):
     def test_row3_gap_gives_duplicate(self):
         """A segment above rcv_nxt is stored and answered with a duplicate ACK."""
         rx, events = make()
-        before = rx.window()
+        before = rx.rwnd()
         self.assertEqual(rx.on_segment(ISN + 100, b"b" * 100, False, 1.0), 'duplicate')
         self.assertEqual(rx.rcv_nxt, ISN)
         self.assertEqual(rx.out_of_order, {ISN + 100: b"b" * 100})
-        self.assertEqual(rx.window(), before)
+        self.assertEqual(rx.rwnd(), before)
         self.assertEqual(rx.read(), b"")
         self.assertEqual(events[-1], ('OUT_OF_ORDER',
                                       {'seq': ISN + 100, 'len': 100, 'expected': ISN}))
@@ -100,11 +100,11 @@ class AckRuleTests(unittest.TestCase):
         """Sending any segment with the ACK clears the delayed ACK."""
         rx, _ = make()
         rx.on_segment(ISN, b"a" * 100, False, 1.0)
-        rx.ack_sent(rx.window())
+        rx.ack_sent(rx.rwnd())
         self.assertFalse(rx.ack_pending)
         self.assertIsNone(rx.next_deadline())
         self.assertIsNone(rx.on_tick(5.0))
-        self.assertEqual(rx.last_advertised, BUF - 100)
+        self.assertEqual(rx.last_rwnd, BUF - 100)
         # The next in-order segment starts a new delay instead of 'cumulative'
         self.assertIsNone(rx.on_segment(ISN + 100, b"b" * 10, False, 2.0))
 
@@ -161,36 +161,36 @@ class WindowTests(unittest.TestCase):
     """Receive window of slide 3-94."""
 
     def test_window_formula(self):
-        """rwnd = RcvBuffer - (LastByteRcvd - LastByteRead)."""
+        """rwnd = RcvBuffer - buffered data (slide 3-94)."""
         rx, _ = make()
-        self.assertEqual(rx.window(), BUF)
+        self.assertEqual(rx.rwnd(), BUF)
         rx.on_segment(ISN, b"x" * 1000, False, 1.0)
-        self.assertEqual(rx.window(), BUF - 1000)
+        self.assertEqual(rx.rwnd(), BUF - 1000)
         rx.on_segment(ISN + 1000, b"x" * 500, False, 1.0)
-        self.assertEqual(rx.window(), BUF - 1500)
-        self.assertEqual(rx.window(), rx.buffer_size - (rx.last_byte_rcvd - rx.last_byte_read))
+        self.assertEqual(rx.rwnd(), BUF - 1500)
+        self.assertEqual(rx.rwnd(), rx.rcv_buffer - len(rx.buffered_data))
         rx.read(700)
-        self.assertEqual(rx.window(), BUF - 800)
+        self.assertEqual(rx.rwnd(), BUF - 800)
         rx.read()
-        self.assertEqual(rx.window(), BUF)
+        self.assertEqual(rx.rwnd(), BUF)
 
     def test_beyond_right_edge_trimmed(self):
         """Data past rcv_nxt + window is cut off and reported."""
-        rx, events = make(buffer_size=1000)
+        rx, events = make(rcv_buffer=1000)
         rx.on_segment(ISN, b"a" * 600, False, 1.0)
         reason = rx.on_segment(ISN + 600, b"b" * 600, True, 1.0)
         self.assertEqual(reason, 'cumulative')
         self.assertEqual(rx.rcv_nxt, ISN + 1000)
         self.assertIsNone(rx.fin_seq)
         self.assertFalse(rx.fin_received)
-        self.assertEqual(rx.window(), 0)
-        self.assertIn(('OUT_OF_WINDOW', {'seq': ISN + 600, 'len': 600, 'window': 400}),
+        self.assertEqual(rx.rwnd(), 0)
+        self.assertIn(('OUT_OF_WINDOW', {'seq': ISN + 600, 'len': 600, 'rwnd': 400}),
                       events)
         self.assertEqual(rx.read(), b"a" * 600 + b"b" * 400)
 
     def test_out_of_order_beyond_edge_trimmed(self):
         """An out-of-order segment is also cut at the right edge."""
-        rx, _ = make(buffer_size=1000)
+        rx, _ = make(rcv_buffer=1000)
         self.assertEqual(rx.on_segment(ISN + 900, b"z" * 300, False, 1.0), 'duplicate')
         self.assertEqual(rx.out_of_order, {ISN + 900: b"z" * 100})
         self.assertEqual(rx.on_segment(ISN + 1000, b"z" * 300, False, 1.0), 'out_of_window')
@@ -198,12 +198,12 @@ class WindowTests(unittest.TestCase):
 
     def test_zero_window_takes_no_data_but_answers(self):
         """With window 0 new data is refused yet still gets an ACK."""
-        rx, events = make(buffer_size=100)
+        rx, events = make(rcv_buffer=100)
         rx.on_segment(ISN, b"a" * 100, False, 1.0)
-        self.assertEqual(rx.window(), 0)
+        self.assertEqual(rx.rwnd(), 0)
         self.assertEqual(rx.on_segment(ISN + 100, b"b", False, 1.2), 'out_of_window')
         self.assertEqual(rx.rcv_nxt, ISN + 100)
-        self.assertEqual(rx.window(), 0)
+        self.assertEqual(rx.rwnd(), 0)
         self.assertEqual(names(events)[-1], 'OUT_OF_WINDOW')
         rx.read()
         self.assertEqual(rx.on_segment(ISN + 100, b"b", False, 1.3), 'cumulative')
@@ -218,34 +218,35 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(rx.rcv_nxt, ISN + 10)
 
     def test_window_never_out_of_range(self):
-        """window() stays between 0 and buffer_size."""
-        rx, _ = make(buffer_size=10)
-        rx.last_byte_rcvd = 50
-        self.assertEqual(rx.window(), 0)
-        rx.last_byte_rcvd, rx.last_byte_read = 0, 5
-        self.assertEqual(rx.window(), 10)
+        """rwnd() stays between 0 and rcv_buffer: trim_to_window never overfills the buffer."""
+        rx, _ = make(rcv_buffer=10)
+        rx.on_segment(ISN, b"x" * 50, False, 1.0)
+        self.assertEqual(len(rx.buffered_data), 10)
+        self.assertEqual(rx.rwnd(), 0)
+        rx.read()
+        self.assertEqual(rx.rwnd(), 10)
 
     def test_window_update_due_on_crossing(self):
-        """window_update_due is true only when crossing buffer_size // 4 from below."""
-        rx, _ = make(buffer_size=1000)
+        """window_update_due is true only when crossing rcv_buffer // 4 from below."""
+        rx, _ = make(rcv_buffer=1000)
         self.assertFalse(rx.window_update_due())
         rx.on_segment(ISN, b"a" * 900, False, 1.0)
-        rx.ack_sent(rx.window())  # advertised 100, below 250
+        rx.ack_sent(rx.rwnd())  # advertised 100, below 250
         self.assertFalse(rx.window_update_due())
         rx.read(100)  # window 200, still below the quarter
         self.assertFalse(rx.window_update_due())
         rx.read(50)  # window 250, crosses
         self.assertTrue(rx.window_update_due())
-        rx.ack_sent(rx.window())
+        rx.ack_sent(rx.rwnd())
         self.assertFalse(rx.window_update_due())
         rx.read()
         self.assertFalse(rx.window_update_due())
 
     def test_no_update_when_last_window_was_large(self):
         """A read after a large advertised window needs no update."""
-        rx, _ = make(buffer_size=1000)
+        rx, _ = make(rcv_buffer=1000)
         rx.on_segment(ISN, b"a" * 500, False, 1.0)
-        rx.ack_sent(rx.window())  # 500
+        rx.ack_sent(rx.rwnd())  # 500
         rx.read()
         self.assertFalse(rx.window_update_due())
 
@@ -266,7 +267,7 @@ class FinTests(unittest.TestCase):
 
     def test_empty_fin_with_zero_window(self):
         """A bare FIN needs no buffer space."""
-        rx, _ = make(buffer_size=5)
+        rx, _ = make(rcv_buffer=5)
         rx.on_segment(ISN, b"hello", False, 1.0)
         self.assertEqual(rx.on_segment(ISN + 5, b"", True, 1.0), 'fin')
         self.assertEqual(rx.rcv_nxt, ISN + 6)
@@ -322,7 +323,7 @@ class RandomStreamTest(unittest.TestCase):
             segments.append((ISN + start, piece, start + len(piece) >= len(data)))
         segments.extend(rng.sample(segments, len(segments) // 4))
 
-        rx, _ = make(buffer_size=8192)
+        rx, _ = make(rcv_buffer=8192)
         out = bytearray()
         now = 0.0
         for _ in range(200):
@@ -330,8 +331,8 @@ class RandomStreamTest(unittest.TestCase):
             for seq, payload, fin in segments:
                 now += 0.001
                 rx.on_segment(seq, payload, fin, now)
-                self.assertTrue(0 <= rx.window() <= rx.buffer_size)
-                self.assertLessEqual(len(rx.ready), rx.buffer_size)
+                self.assertTrue(0 <= rx.rwnd() <= rx.rcv_buffer)
+                self.assertLessEqual(len(rx.buffered_data), rx.rcv_buffer)
                 if rng.random() < 0.3:
                     out.extend(rx.read(rng.randint(1, 4000)))
             out.extend(rx.read())

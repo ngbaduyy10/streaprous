@@ -33,12 +33,11 @@ class LoadSettingsTest(unittest.TestCase):
         s = load_settings({})
         self.assertEqual(s.mss_limit, 1460)
         self.assertEqual(s.default_peer_mss, 536)
-        self.assertEqual(s.recv_buffer, 32768)
+        self.assertEqual(s.recv_buffer, 4096)
         self.assertEqual(s.initial_ssthresh, 65536)
         self.assertEqual((s.initial_rto, s.min_rto, s.max_rto), (1.0, 0.2, 4.0))
         self.assertEqual(s.max_retries, 8)
         self.assertEqual(s.delayed_ack, 0.1)
-        self.assertEqual((s.persist_min, s.persist_max), (0.2, 2.0))
         self.assertEqual(s.linger, 2.0)
         self.assertEqual(s.tick, 0.01)
         self.assertEqual(s.peer_silence, 60.0)
@@ -120,7 +119,7 @@ class DescribeTest(unittest.TestCase):
 
     def test_defaults(self):
         text = describe(load_settings({}))
-        self.assertTrue(text.startswith('mss_limit=1460 rcvbuf=32768 ssthresh=65536 '))
+        self.assertTrue(text.startswith('mss_limit=1460 rcvbuf=4096 ssthresh=65536 '))
         self.assertIn('drop_send= ', text)
         self.assertIn('loss=0.0', text)
 

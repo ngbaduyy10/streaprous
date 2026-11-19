@@ -170,7 +170,8 @@ Prints in V1:
 ```
 
 `RWND_ZERO`: the client advertised window 0 and the server stops sending. `PROBE`: one byte every
-0.2 s, doubling up to 2 s. `RWND_OPEN`: the client read, the window is open again, sending resumes.
+0.5 s (the saved lines above come from our first version, when the interval doubled from 0.2 s).
+`RWND_OPEN`: the client read, the window is open again, sending resumes.
 If there is no `RWND_ZERO`, see Troubleshooting.
 
 #### Demo c (trace): congestion window chart

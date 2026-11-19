@@ -96,8 +96,7 @@ class TcpConnection:
         # One Reno per connection, so one loss does not slow down another (book 3.7.3).
         self.cc = RenoCongestion(self.mss, settings.initial_ssthresh, self._on_event)
         self.sender = TcpSender(self.iss, self.mss, rwnd, self.rtt, self.cc,
-                                settings.max_retries, settings.persist_min,
-                                settings.persist_max, self._on_event)
+                                settings.max_retries, self._on_event)
         self.receiver = TcpReceiver(self.irs, settings.recv_buffer, settings.delayed_ack,
                                     self._on_event)
         self.loss = LossInjector(settings.drop_send, settings.drop_recv,
@@ -217,7 +216,7 @@ class TcpConnection:
              now       current time in seconds
         """
         for seg in segments:
-            window = self.receiver.window()
+            window = self.receiver.rwnd()
             ack_seq = wrap(self.receiver.rcv_nxt)
             try:
                 if seg.payload:
@@ -261,7 +260,7 @@ class TcpConnection:
              reason  why the ACK goes out, such as 'delayed', 'duplicate' or 'window_update'
              now     current time in seconds
         """
-        window = self.receiver.window()
+        window = self.receiver.rwnd()
         ack = self.receiver.rcv_nxt
         # pure ACKs carry snd_max, so a go-back after a timeout never puts
         # them below what the client already has (BSD tcp_output, background)

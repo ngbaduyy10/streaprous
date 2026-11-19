@@ -364,8 +364,8 @@ class SendTests(ConnectionTestCase):
                          [SERVER_SEQ, SERVER_SEQ + 536, SERVER_SEQ + 1072, SERVER_SEQ + 1608])
         for seg in segments:
             self.assertEqual(seg.ack, CLIENT_SEQ + 80)
-            self.assertEqual(seg.window, conn.receiver.window())
-            self.assertEqual(seg.window, 32768 - 80)
+            self.assertEqual(seg.window, conn.receiver.rwnd())
+            self.assertEqual(seg.window, 4096 - 80)
             self.assertEqual(seg.flags, PSH | ACK)
             self.assertEqual((seg.src_ip, seg.dst_ip), (SERVER_IP, CLIENT_IP))
             self.assertEqual((seg.src_port, seg.dst_port), (SERVER_PORT, CLIENT_PORT))
@@ -433,7 +433,7 @@ class ReceiveTests(ConnectionTestCase):
         self.assertEqual(segments[0].flags, ACK)
         self.assertEqual(segments[0].seq, SERVER_SEQ)
         self.assertEqual(segments[0].ack, CLIENT_SEQ + 100)
-        self.assertEqual(segments[0].window, 32768 - 100)
+        self.assertEqual(segments[0].window, 4096 - 100)
         self.assertEqual(segments[0].payload, b"")
         self.assertEqual(self.events('ACK_SENT')[0]['reason'], 'delayed')
 

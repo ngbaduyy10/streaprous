@@ -135,7 +135,7 @@ copies until the receiver says which page it wants next. Here is our version wit
      packet --> parse_tcp_packet
                   ACK number + window --> TcpSender.on_ack      --> segments to send --> sendto
                   data + FIN          --> TcpReceiver.on_segment --> ACK now?        --> sendto
-     timers --> TcpSender.on_tick (retransmission, persist)
+     timers --> TcpSender.on_tick (retransmission, probe)
                 TcpReceiver.on_tick (delayed ACK)
 
   handler thread (one per connection): HttpAdapter.handle_client_raw
@@ -177,12 +177,10 @@ slide 3-94:
 `TcpSender._send_allowed(now)` is the slide 3-125 action "transmit new segment(s), as allowed". It
 loops:
 
-1. Take `length = min(mss, bytes left to send, usable window)`. Stop if it is 0 or less.
-2. If the segment would be shorter than one MSS while data is still in flight, and it is not the last
-   piece of data, wait. ACKs will soon make room for a full segment. With nothing in flight, a short
-   segment goes out anyway, so a window smaller than one MSS cannot stall us.
-3. Send it, move `snd_nxt` forward, and start the retransmission timer if it is not running.
-4. When all data is sent and `close()` was called, send the FIN.
+1. Take `length = min(mss, bytes left to send, usable window)`. Stop if it is 0 or less. So the
+   window is filled exactly, and a segment can be shorter than one MSS (slide 3-122 counts bytes).
+2. Send it, move `snd_nxt` forward, and start the retransmission timer if it is not running.
+3. When all data is sent and `close()` was called, send the FIN.
 
 So each feature has its own job in this one loop:
 
@@ -224,6 +222,9 @@ Every event, whatever the level, is also one row in a CSV trace,
 `out/trace_<client_ip>_<client_port>.csv`, with the columns
 `time,event,cwnd,ssthresh,rwnd,in_flight,snd_una,snd_nxt,adv_wnd`. The CSV is where we look for the
 level-2 detail after a demo.
+
+The log lines quoted in this guide were saved from runs of our first version, when RcvBuffer was
+32768, so they show `adv=32768`; today RcvBuffer is 4096 (Part 3).
 
 In `server.log` the teacher's dispatcher thread prints at the same time as our worker. So a line can
 end with `[Sock_dispatcher] Route packet ...` glued on. In the quotes below we cut that tail off and
@@ -354,7 +355,7 @@ time,  event,   cwnd, ssthresh, rwnd,  in_flight, snd_una, snd_nxt
 0.2338,SEND,    2920, 2920,     65535, 1460,      9301,    10761    new data again
 ```
 
-(We dropped the `adv_wnd` column, which stays 32768, and added the comments on the right.)
+(We dropped the `adv_wnd` column, which stayed 32768 in this run, and added the comments on the right.)
 
 #### 2.5.1 The normal case: send, time, ACK
 
@@ -425,13 +426,13 @@ Three more cases are not rows on the slide but follow from it:
 
 - All the bytes were received before: event `DUP_SEGMENT`, ACK at once (`'old_segment'`). This is the
   premature-timeout case of slide 3-86, where B answers a resent segment with a cumulative ACK.
-- A segment reaches past the window's right edge: the extra part is cut off, event `OUT_OF_WINDOW`
-  (Part 3).
+- A segment reaches past the window's right edge: `trim_to_window` cuts the extra part off, event
+  `OUT_OF_WINDOW` (Part 3).
 - The FIN arrives in order: `rcv_nxt` moves one past it, event `FIN_RECEIVED`, ACK at once (`'fin'`).
 
-`_deliver_in_order` appends bytes to `ready` and moves `rcv_nxt`. `_store_out_of_order` keeps a segment
+`_deliver_in_order` appends bytes to `buffered_data` and moves `rcv_nxt`. `_store_out_of_order` keeps a segment
 above the gap. If two segments start at the same number, the longer one is kept.
-`_pull_from_out_of_order` moves stored segments into `ready` once they touch `rcv_nxt`. It drops
+`_pull_from_out_of_order` moves stored segments into `buffered_data` once they touch `rcv_nxt`. It drops
 segments already covered and cuts overlaps, so every byte is delivered exactly once.
 
 A tiny trace. `rcv_nxt` = 1000 (the client's numbers are large, so we use small ones here), and the
@@ -444,7 +445,7 @@ seq 1536 len 536 arrives -> row 4: deliver it + pull 2072 from the store, rcv_nx
 seq 1536 len 536 again   -> already have it: DUP_SEGMENT, ACK 2608
 ```
 
-`TcpConnection._send_ack(reason, now)` builds the pure ACK: `ack = rcv_nxt`, `window = window()`.
+`TcpConnection._send_ack(reason, now)` builds the pure ACK: `ack = rcv_nxt`, `window = rwnd()`.
 Every data segment we send also carries `ack = rcv_nxt` (piggybacking, slide 3-80), and
 `TcpReceiver.ack_sent` then clears the pending delayed ACK.
 
@@ -602,126 +603,123 @@ and `DUP_SEGMENT` lines in `out/upload/server.log` (2.5.4).
 
 | File | Functions |
 | --- | --- |
-| `tcp_receiver.py` | `TcpReceiver.window` (the advertised window), `TcpReceiver.window_update_due`, `TcpReceiver.read`, `TcpReceiver.ack_sent`, `TcpReceiver.on_segment` (cuts data past the right edge) |
-| `tcp_sender.py` | `TcpSender._usable_window`, `TcpSender._update_rwnd`, `TcpSender._probe_needed`, `TcpSender._check_persist`, `TcpSender._send_window_probe`, `TcpSender.on_ack` (accepts an ACK of the probe byte), `TcpSender.on_tick` |
+| `tcp_receiver.py` | `TcpReceiver.rwnd` (the advertised window), `TcpReceiver.trim_to_window` (cuts data past the right edge), `TcpReceiver.read`, `TcpReceiver.window_update_due`, `TcpReceiver.ack_sent` |
+| `tcp_sender.py` | `TcpSender._usable_window` (`min(cwnd, rwnd)` minus in flight), `TcpSender.update_rwnd`, `TcpSender.check_probe_timer`, `TcpSender.send_probe`, `TcpSender.on_ack` (accepts an ACK of the probe byte), `TcpSender.on_tick` |
 | `tcp_connection.py` | `TcpConnection.recv` (sends the window update), `TcpConnection._send_ack`, `TcpConnection._transmit` (window field on every segment), `TcpConnection._note_advertised` |
+| `tcp_config.py` | `recv_buffer`: RcvBuffer, 4096 bytes unless `STREAPROUS_RCVBUF` sets it (1 to 65535) |
 | `streaprous_raw_connection.py` | `build_tcp_packet` and `send_tcp_data_segment` get a `window` argument; its default is `RECV_BUFFER` from `tcp_config.py` |
+
+Tests: `WindowTests` in `test_tcp_receiver.py`; `SmallSegmentTest` and `ZeroWindowTest` in
+`test_tcp_sender.py`; `test_slow_reader` and `test_lost_window_update` in `test_transfer_sim.py`.
 
 ### 3.2 Slides it implements
 
 - 3-90 to 3-93: the problem. "What happens if network layer delivers data faster than application
   layer removes data from socket buffers?" The answer: "receiver controls sender, so sender won't
   overflow receiver's buffer by transmitting too much, too fast".
-- 3-94: the receiver "advertises" free buffer space in the rwnd field; the "sender limits amount of
-  unACKed ('in-flight') data to received rwnd"; this "guarantees receive buffer will not overflow".
 - 3-95: the receive window field in the TCP header.
-- 3-79: the window drawn in the sender's sequence space.
+
+| Slide | The slide's words | Our function | Mark |
+| --- | --- | --- | --- |
+| 3-94 | TCP receiver "advertises" free buffer space in rwnd field in TCP header; sender limits amount of unACKed ("in-flight") data to received rwnd | `TcpReceiver.rwnd`, `TcpConnection._transmit`, `TcpConnection._send_ack`, `TcpSender.update_rwnd`, `TcpSender._usable_window` | as the slide |
+| 3-94 | "guarantees receive buffer will not overflow": the sender's limit does it, and our receiver also cuts any data past the right edge of rwnd | `TcpReceiver.trim_to_window` | as the slide |
+| 3-94 | RcvBuffer = 4096 bytes ("typical default is 4096 bytes"), set by `STREAPROUS_RCVBUF` ("set via socket options") | `tcp_config.py` `recv_buffer` | as the slide |
+| 3-90 | Application removing data from TCP socket buffers | `TcpReceiver.read`, `TcpConnection.recv` | as the slide |
+| 3-94 | With rwnd = 0 and nothing in flight, we send one data byte every 0.5 s | `TcpSender.send_probe`, `TcpSender.check_probe_timer` | extra: with rwnd 0 we send nothing, so no ACK comes back; if the receiver's window update is lost, both sides wait forever (one-byte probes are the textbook's, **Background**) |
+| 3-94 | After the application reads, one ACK when the free space grows from below a quarter of RcvBuffer to at least a quarter | `TcpReceiver.window_update_due` | extra: the receiver advertises rwnd only in segments it sends, so after a zero or small window nothing else tells the sender that space opened (our Lab 2 rule F4) |
 
 ### 3.3 Mental model
 
-The receiver has a bucket of fixed size (RcvBuffer). TCP pours arriving bytes in, and the application
-scoops them out with `read`. Every ACK says how much empty space is left. The sender never has more
-bytes in flight than that space, so the bucket cannot overflow.
+The receiver's TCP keeps arriving bytes in a buffer of RcvBuffer bytes until the application reads
+them (3-90 to 3-94). If the network delivers faster than the application reads, the buffer fills, and
+any further byte would have to be thrown away and sent again. So the receiver tells the sender how much
+room is left, `rwnd` = RcvBuffer - buffered data, in the window field of every segment it sends, and the
+sender keeps its in-flight bytes at or below that rwnd.
 
 ```text
-              RcvBuffer = 32768 bytes
- +-------------------------------+----------------------+
- |  in-order bytes not yet read  |   free space = rwnd  |  <- the advertised window
- +-------------------------------+----------------------+
-    ^ the application reads here    ^ new segments land here
+|<----------------------------- RcvBuffer = 4096 ----------------------------->|
+|  buffered data (in order, not yet read)  |        free buffer space = rwnd     |
+     ^ the application reads here                ^ new segments land here
 ```
 
 Flow control works in both directions in our server:
 
-- **We are the receiver** when a client uploads (POST). `TcpReceiver.window()` is the number we
+- **We are the receiver** when a client uploads (POST). `TcpReceiver.rwnd()` is the number we
   advertise.
 - **We are the sender** when we answer (GET). The client's window arrives in every ACK and becomes our
   `rwnd`.
 
 ### 3.4 The terms, one at a time
 
-- **RcvBuffer** (slide 3-94). Our receive buffer: 32768 bytes (`STREAPROUS_RCVBUF`, 1 to 65535). It
-  must stay at most 65535, because the window field has 16 bits and we do not use window scaling.
-- **rwnd, the advertised window** (slides 3-94, 3-95). Our code: `RcvBuffer − (LastByteRcvd −
-  LastByteRead)`, that is, `buffer_size − len(ready)`.
-- **Zero window.** rwnd = 0: the buffer is full, so stop sending.
+- **RcvBuffer** (slide 3-94). Our receive buffer: 4096 bytes, the slide's "typical default"
+  (`STREAPROUS_RCVBUF`, 1 to 65535). It must stay at most 65535, because the window field has 16 bits
+  and we do not use window scaling.
+- **rwnd, the advertised window** (slides 3-94, 3-95). `rcv_buffer - len(buffered_data)`: RcvBuffer
+  minus the in-order bytes the application has not read yet. The textbook writes the same thing as
+  `RcvBuffer - [LastByteRcvd - LastByteRead]` (**Background**).
+- **Zero window.** rwnd = 0: the buffer is full, so the sender stops.
 - **Window update.** An ACK sent only to tell the sender that the window opened again.
-- **Zero-window probe and persist timer** (**Background**). When rwnd is 0 and nothing is in flight,
-  no ACK will ever come to tell us the window opened. So a timer asks, by sending one byte.
+- **Zero-window probe** (**Background**). When rwnd is 0 and nothing is in flight, no ACK will ever come
+  to tell the sender that the window opened. So the sender asks, by sending one byte every 0.5 s.
 
 ### 3.5 The mechanism, traced with our numbers
 
-#### 3.5.1 As receiver: computing the window
+We ran `TcpReceiver` with RcvBuffer 4096 and a slow reader: 1000-byte segments arrive from seq 1, and
+the application reads 1000 bytes now and then. Then we ran `TcpSender` against a closed window (we set
+cwnd to 8000 by hand, so only rwnd limits it).
 
-`TcpReceiver.window()` returns `buffer_size − (last_byte_rcvd − last_byte_read)`, kept between 0 and
-`buffer_size`. With RcvBuffer = 32768:
+#### 3.5.1 As receiver: the window and the window update
 
 ```text
-start                                       unread 0      window 32768
-3 in-order segments of 1460 arrive          unread 4380   window 28388
-the application reads 2048 bytes            unread 2332   window 30436
-the application stops reading; the client
-fills the buffer                            unread 32768  window 0      -> WINDOW_ZERO
+t=0.00  segment 1..1000       -> wait (3-85 row 1)       buffered=1000  rwnd()=3096
+t=0.01  segment 1001..2000    -> cumulative ACK=2001     buffered=2000  rwnd=2096 advertised
+t=0.02  segment 2001..3000    -> wait                    buffered=3000  rwnd()=1096
+t=0.03  segment 3001..4000    -> cumulative ACK=4001     buffered=4000  rwnd=96 advertised
+t=0.04  segment 4001..5000    -> OUT_OF_WINDOW: only 4001..4096 fit, the rest is cut   rwnd()=0
+t=0.14  delayed ACK=4097, rwnd=0
+t=0.50  app reads 1000        -> rwnd()=1000, below a quarter (1024): no window update yet
+t=1.00  app reads 1000        -> rwnd()=2000, at least a quarter: WINDOW_UPDATE, ACK=4097 rwnd=2000
+t=1.05  segment 4097..5096    -> wait                    rwnd()=1000
 ```
 
-This is the surprising part: bytes waiting in `out_of_order` are **not** subtracted. They lie inside
-the space we already advertised, between `rcv_nxt` and `rcv_nxt + window()`, and `on_segment` cuts
-anything past that right edge (`OUT_OF_WINDOW`). So the memory we use stays at or below RcvBuffer
-anyway.
+rwnd only counts in-order bytes the application has not read. Bytes waiting in `out_of_order` are not
+subtracted: they lie inside the window we already advertised, between `rcv_nxt` and `rcv_nxt +
+rwnd()`. The fifth segment did not fit, so `trim_to_window` kept the 96 bytes that did (a correct
+sender never sends past rwnd, as 3.5.2 shows with its 96-byte segment). The first read freed 1000
+bytes, under a quarter of 4096, so no ACK went out: a tiny update would only let the sender send a
+tiny segment. The second read reached 2000, so `TcpConnection.recv` asked `window_update_due()`, got
+True, and sent the update at once.
 
-Every segment we send carries `window()` in its window field (`_transmit`, `_send_ack`), using the
+Every segment we send carries `rwnd()` in its window field (`_transmit`, `_send_ack`), using the
 `window` argument we added to the teacher's builders. `_note_advertised` logs `WINDOW_ZERO` when the
 advertised value changes from above 0 to 0.
 
-#### 3.5.2 As receiver: when to send a window update
-
-After the application reads, `TcpConnection.recv` asks `TcpReceiver.window_update_due()`:
+#### 3.5.2 As sender: obeying the client's window
 
 ```text
-last_advertised < RcvBuffer / 4 <= window()        (RcvBuffer / 4 = 8192 for 32768)
+--- the client advertises 4096, then 0
+t=0.00  sends 1, 1001, 2001, 3001 (1000 bytes each) and 4001 (96 bytes): in flight = 4096 = rwnd
+t=0.20  ACK=4097 window=0     -> RWND_ZERO; nothing in flight, data waits: probe timer set for 0.70
+t=0.70  PROBE: one byte at seq 4097
+t=0.75  ACK=4097 window=0     -> still closed; the next probe at 1.20
+t=1.20  PROBE: one byte at seq 4097
+t=1.25  ACK=4097 window=2000  -> RWND_OPEN; sends 4097 (1000 bytes) and 5097 (the last 904 bytes)
 ```
 
-If it is true, `_send_ack('window_update', now)` goes out at once. This is our Lab 2 design rule F4
-(**Background**). Traced:
+Every ACK carries the client's window. `on_ack` hands it to `update_rwnd`, which logs `RWND_ZERO` when
+it drops to 0 and `RWND_OPEN` when it opens again. `_usable_window()` is `min(cwnd, rwnd)` minus the
+bytes in flight (1.5), so a small rwnd caps us however large cwnd is, and the 96-byte segment at
+t=0.00 fills the window exactly.
 
-```text
-we advertised 0 (buffer full)
-read 4096 -> window 4096; 4096 < 8192, no update yet
-read 4096 -> window 8192; last advertised 0 < 8192 <= 8192 -> WINDOW_UPDATE window=8192
-```
-
-Why wait for a quarter? Each read frees only a little space. An extra ACK after every small read adds
-packets that carry little news, and a sender told about a tiny window may answer with tiny segments
-(silly window syndrome, **Background**). Waiting until a quarter of the buffer is free makes each
-update worth sending. Why send one at all? A sender facing a zero window would otherwise wait for its
-own probe timer.
-
-#### 3.5.3 As sender: obeying the client's window
-
-Every ACK carries the client's window. `on_ack` hands it to `_update_rwnd`, which logs `RWND_ZERO`
-when it drops to 0 and `RWND_OPEN` when it opens again. `_usable_window()` uses
-`min(cwnd, rwnd) − in flight` (1.5), so a small rwnd caps us however large cwnd is.
-
-When rwnd is 0, nothing is in flight and data is waiting (`_probe_needed`), `_check_persist` arms the
-persist timer. When it expires, `_send_window_probe` sends **one byte** at `snd_nxt`:
+When rwnd is 0, nothing is in flight and data is waiting, `check_probe_timer` sets the probe timer.
+When it expires, `send_probe` sends **one byte** at `snd_nxt`:
 
 - The byte is not counted in flight, and `snd_nxt` does not move.
 - The client must answer it with an ACK that carries its current window. So even if the client's
   window update was lost, we learn when the window opens.
 - If the client keeps the byte and ACKs `snd_nxt + 1`, `on_ack` accepts that ACK (its upper limit is
   `probe_seq + 1`).
-- The interval starts at 0.2 s and doubles up to 2 s. `RWND_OPEN` resets it to 0.2 s. This is our Lab
-  2 design rule F3 (**Background**).
-
-Traced on the real slow-reader run (MSS 1460, RTO and ssthresh at their defaults):
-
-```text
-t=0.70  ACK 39961 with window 0  -> RWND_ZERO; nothing in flight; persist timer 0.2 s
-t=0.90  PROBE seq=39961 (1 byte)  -> client: window 0 still; next interval 0.4 s
-t=1.31  PROBE seq=39961           -> window 0;  next 0.8 s
-t=2.11  PROBE seq=39961           -> window 0;  next 1.6 s
-t=2.63  client's own update: 2920 -> RWND_OPEN; interval back to 0.2 s; SEND 39961.. resumes
-```
+- The interval stays 0.5 s (`PROBE_INTERVAL`) for as long as the window stays 0.
 
 ### 3.6 Why it exists: what breaks without it
 
@@ -729,72 +727,80 @@ t=2.63  client's own update: 2920 -> RWND_OPEN; interval back to 0.2 s; SEND 399
   what does not fit, and every dropped byte costs a retransmission, sent into a buffer that is still
   full.
 - Without our window on the receiver side, the dispatcher's queue (100 packets) could overflow while
-  our application is slow. With RcvBuffer 32768 and 536-byte client segments, at most 61 segments fit
+  our application is slow. With RcvBuffer 4096 and 536-byte client segments, at most 8 segments fit
   in the window, so the queue never drops data the window allowed.
 - Without the probe, a lost window update leaves both sides waiting for each other forever: the
   sender waits for an ACK, and the receiver has nothing to ACK. (`test_lost_window_update` builds
   exactly this case.)
 
-### 3.7 Demos
+### 3.7 Known limits
 
-**We are the sender: the slow reader.**
+- **The teacher's dispatcher queue holds 100 packets and drops silently when full.** Why we keep it:
+  the fix is in the teacher's dispatcher; RcvBuffer 4096 lets the client send at most 8 of its
+  536-byte segments, so the queue stays far below 100. Answer: "A drop there looks like a loss, and our
+  timer or the client's resends it."
+- **`run_conn_send` blocks until every byte is ACKed.** Why we keep it: the backend answers one request
+  per connection, so waiting costs nothing here. Answer: "A server that sends while it reads would need
+  a separate send buffer; ours never does."
+- **With RcvBuffer at or below one client segment, every segment waits the 100 ms delayed ACK.** Why we
+  keep it: 3-85 row 2 needs a second in-order segment, and only one fits. Answer: "That follows 3-85
+  row 1; the default 4096 holds 7 of the client's 536-byte segments, so it only shows if
+  `STREAPROUS_RCVBUF` is set below about 1 KB."
+- **If a receiver shrinks its window to 0 while data is in flight, the timer resends into the closed
+  window and Reno treats it as a loss.** Why we keep it: probes run only with nothing in flight, and a
+  Linux client (**Background**) never shrinks a window it already advertised. Answer: "Each timeout
+  resend acts as a probe; when the window opens, the transfer goes on."
+- **Small tail segments.** After each ACK the sender fills min(cwnd, rwnd) minus in flight exactly, so
+  a short segment can follow the full ones. Why we keep it: 3-122 counts bytes, and 3-125 says
+  "transmit new segment(s), as allowed"; waiting for a full segment would be a rule the slides do not
+  have. Answer: "We fill the window exactly, as 3-122 allows; it costs more packets, not correctness."
 
-```sh
-python streaprous/docker/lab.py demo slow-reader
-```
+### 3.8 Questions to expect
 
-The Linux client downloads `demo_256k.bin`. It asks for a 4096-byte socket buffer, reads 4096 bytes
-every 0.05 s, and pauses 2 s after 32768 bytes. Its windows stay small (`OPEN ... rwnd=2920`). Point at these lines (`out/slow-reader/server.log`):
+**Q:** rwnd is 0 and our window update is lost. Does the transfer hang?
+**A:** No. With rwnd 0, nothing in flight and data waiting, the sender sends one probe byte every
+0.5 s, and the receiver's answer carries the new window (`test_lost_window_update_recovered_by_probe`,
+`test_lost_window_update`, `test_probe_interval_is_fixed`).
 
-```text
-[Streap_tcp] 172.28.0.20:50478 RWND_ZERO ack=39961 | cwnd=20440 ssthresh=32768 rwnd=0 flight=0 adv=32768
-[Streap_tcp] 172.28.0.20:50478 PROBE seq=39961 interval=0.200 | cwnd=21900 ssthresh=32768 rwnd=0 flight=0 adv=32768
-[Streap_tcp] 172.28.0.20:50478 PROBE seq=39961 interval=0.400 | cwnd=21900 ssthresh=32768 rwnd=0 flight=0 adv=32768
-[Streap_tcp] 172.28.0.20:50478 PROBE seq=39961 interval=0.800 | cwnd=21900 ssthresh=32768 rwnd=0 flight=0 adv=32768
-[Streap_tcp] 172.28.0.20:50478 RWND_OPEN rwnd=2920 | cwnd=21900 ssthresh=32768 rwnd=2920 flight=0 adv=32768
-```
+**Q:** rwnd is smaller than one MSS. Do you wait for a full segment?
+**A:** No: `_send_allowed` sends min(MSS, data left, usable window) bytes, so a short segment goes out,
+with or without data in flight (`test_room_below_mss_used_while_in_flight`,
+`test_small_segment_when_nothing_in_flight`).
 
-Read them aloud: cwnd is 21900, yet `flight=0`. The network would allow 15 segments, but the receiver
-allows none, so flow control wins `min(cwnd, rwnd)`. Right after `RWND_OPEN` the teacher's builder
-prints `[Streap_raw] send_tcp_data_segment: seq=39961, ack_seq=3802599222, payload_len=1460,
-flags=0x18`, so the transfer continues from the probed byte. The download still ends `expect=ok`.
+**Q:** A segment does not fit the free buffer.
+**A:** `trim_to_window` keeps the part up to the right edge of rwnd and logs `OUT_OF_WINDOW`; if the end
+is cut, the FIN goes too and the client resends it (`test_beyond_right_edge_trimmed`).
 
-**We are the receiver: the slow application.**
+**Q:** The window reopens while our probe byte is in the client's buffer.
+**A:** The ACK then covers the probe byte (`probe_seq + 1`), which `snd_nxt` does not count; `on_ack`
+accepts it and `_on_new_ack` moves `snd_nxt` up to it (`test_ack_covering_probe_byte`).
 
-```sh
-python streaprous/docker/lab.py demo slow-app
-```
+**Q:** The window shrinks below what is already in flight.
+**A:** `_usable_window()` is then negative, so nothing new is sent until ACKs bring the bytes in flight
+below rwnd.
 
-The server runs with `STREAPROUS_RCVBUF=16384`, `STREAPROUS_APP_READ_DELAY=0.05` and
-`STREAPROUS_APP_READ_BYTES=2048`: our HTTP code reads 2048 bytes every 0.05 s while Linux uploads
-300 000 bytes. A quarter of 16384 is 4096. The lines (`out/slow-app/server.log`):
+**Q:** Why is rwnd RcvBuffer minus buffered data, and not minus the out-of-order bytes too?
+**A:** 3-94 draws rwnd as the free space after the buffered in-order data; out-of-order bytes sit
+inside the window we already advertised, so counting them would shrink a window the sender already
+uses.
 
-```text
-[Streap_tcp] 172.28.0.20:52546 WINDOW_ZERO ack=3208492850 | cwnd=1460 ssthresh=32768 rwnd=64240 flight=0 adv=0
-[Streap_tcp] 172.28.0.20:52546 WINDOW_UPDATE window=4096 | cwnd=1460 ssthresh=32768 rwnd=64240 flight=0 adv=4096
-[HttpAdapter] Read request: header 150 bytes, body 300000 bytes, sha256 5dd581b085273e13cf72eb568ae2a75b50e94b7d3cb7e0498638f6a0b87a7801
-```
+**Q:** When does the receiver send a window update, and why not after every read?
+**A:** Once, when free space grows from below RcvBuffer/4 to at least RcvBuffer/4 (rule F4). After
+every read we would send many tiny updates, each letting the sender send a tiny segment. Our trace in
+3.5.1 shows a read of 1000 bytes with no update.
 
-Between those two lines, the CSV trace (`out/slow-app/trace_172.28.0.20_52546.csv`) shows the
-application reading twice: `6.5402,APP_READ,...,0` and `6.5911,APP_READ,...,0`. The last column,
-`adv_wnd`, is the window we last *sent*, so it stays 0 until a segment goes out. The free space grows
-0 → 2048 → 4096, and only at 4096 does the update go out (`6.5928,WINDOW_UPDATE,...,4096`). The demo
-also draws `out/slow-app/window.svg`, our advertised window over time. The checks confirm that a
-`win 0` segment is in the packet capture.
+### 3.9 Self-check questions
 
-### 3.8 Self-check questions
-
-1. RcvBuffer is 32768, 20000 in-order bytes are unread, and 3000 bytes sit in `out_of_order`. What
-   window do we advertise?
-   *Answer:* 32768 − 20000 = 12768. Out-of-order bytes are not subtracted, because they lie inside the
+1. RcvBuffer is 4096, 3000 in-order bytes are unread, and 500 bytes sit in `out_of_order`. What window
+   do we advertise?
+   *Answer:* 4096 - 3000 = 1096. Out-of-order bytes are not subtracted, because they lie inside the
    space we already advertised.
-2. The client's window is 0 and its window update gets lost. Why does our download not hang?
-   *Answer:* nothing is in flight and data is waiting, so the persist timer sends a one-byte probe
-   (0.2 s, then 0.4, 0.8, ... up to 2 s). The client must answer it with its current window.
-3. Our window was 0, and the application reads 4096 bytes with RcvBuffer 32768. Do we send a window
-   update?
-   *Answer:* no. The window is 4096, below 8192 (a quarter). We send one once the window reaches 8192.
-   Until then the client's own probes get our current window in reply.
+2. In the trace of 3.5.1, why did the read at t=0.50 send no window update?
+   *Answer:* the window became 1000, below a quarter of 4096 (1024).
+3. When does the sender probe, and how often?
+   *Answer:* when rwnd is 0, nothing is in flight and data is waiting; one byte every 0.5 s.
+4. Which number limits sending when rwnd is 2000 and cwnd 8000?
+   *Answer:* rwnd: min(8000, 2000) = 2000.
 
 ---
 
@@ -1048,12 +1054,11 @@ ask where a number comes from; this is the answer.
 | **Background:** definition of a duplicate ACK | `TcpSender.on_ack`, `TcpConnection.process_packet` | RFC 5681: the same ACK number, data outstanding, no data and no FIN in the segment, and an unchanged window. Window updates and data segments are not loss signals. |
 | **Background:** go-back after a timeout | `TcpSender._on_timeout` (`snd_nxt = snd_una`) | BSD Reno. Resends the rest of the window as cwnd allows, so a burst of losses costs one timeout. Slide 3-84 only resends the one segment. |
 | **Background:** pure ACKs carry `snd_max` | `TcpConnection._send_ack` | BSD `tcp_output`. After a go-back, an ACK never carries a sequence number below what the client already has. |
-| **Background:** persist timer and one-byte probe | `TcpSender._check_persist`, `TcpSender._send_window_probe` | RFC 1122 and RFC 9293. Slide 3-94 says the sender limits in-flight data to rwnd but not what to do at rwnd = 0. The probe carries one real byte at `snd_nxt`, and the receiver must answer with its window. |
-| **Background:** probe interval rule F3 | `persist_min` 0.2 s, `persist_max` 2 s | Our Lab 2 design: first probe after 0.2 s, interval doubles up to 2 s, back to 0.2 s when the window opens. |
+| **Background:** zero-window probe of one byte | `TcpSender.check_probe_timer`, `TcpSender.send_probe` | RFC 1122 and RFC 9293. Slide 3-94 says the sender limits in-flight data to rwnd but not what to do at rwnd = 0. The probe carries one real byte at `snd_nxt`, and the receiver must answer with its window. |
+| **Background:** probe interval 0.5 s | `PROBE_INTERVAL` in `tcp_sender.py` | Our value: one probe every 0.5 s while rwnd is 0, nothing is in flight and data waits. RFC 1122 suggests a growing interval; a fixed one is simpler and costs one byte every 0.5 s. |
 | **Background:** window-update rule F4 | `TcpReceiver.window_update_due`, `TcpConnection.recv` | Our Lab 2 design: send an update at once when the last advertised window was below RcvBuffer/4 and the free space is now at least RcvBuffer/4. It saves an extra ACK after every small read, keeps a stalled sender from being told about tiny windows (silly window syndrome, RFC 1122), and still tells it quickly when real room opens. |
 | **Background:** 536-byte default MSS | `tcp_config.py` `default_peer_mss`, `get_connection` | RFC 879: a peer that sends no MSS option is assumed to accept 536-byte segments. Our SYN-ACK has no options, so clients send us 536-byte segments. We send `min(1460, client's MSS option)`. |
 | **Background:** checksums not verified | `parse_tcp_packet` | In Docker, all 31 client packets we tested had an unfinished checksum field when read on the raw socket. The virtual network card leaves the checksum to hardware that does not exist ("checksum offload"). Verifying would drop every packet. The segments we send still carry the teacher's correct checksum. |
-| **Background:** short segments wait while data is in flight | `TcpSender._send_allowed` | Like Nagle's rule (RFC 896): a piece shorter than one MSS waits for ACKs unless it is the last piece of data or nothing is in flight. |
 | **Background:** closest-integer unwrap of sequence numbers | `unwrap` | Standard modular arithmetic on the 32-bit sequence space. |
 | **Background:** limits for giving up | `max_retries` 8, `peer_silence` 60 s, `linger` 2 s, `request_timeout` 30 s | Our values, so a dead peer cannot hold a connection forever. |
 | **Background:** first client byte from the SYN | `note_client_syn`, `TcpConnection.__init__` | Slide 3-96 says the handshake agrees on the starting sequence numbers. We take the client's from its SYN, because a reordered data segment can arrive before the handshake ACK. |
@@ -1069,8 +1074,8 @@ ask where a number comes from; this is the answer.
   TcpSender.write --> _send_allowed: in flight <= min(cwnd, rwnd)
           |                 ^                ^
           |                 |                |
-          |      RenoCongestion.cwnd   client's window in each ACK (_update_rwnd)
-          |      grows on new ACKs,     0 -> persist timer -> one-byte probe
+          |      RenoCongestion.cwnd   client's window in each ACK (update_rwnd)
+          |      grows on new ACKs,     0 -> probe timer -> one byte every 0.5 s
           |      halves on 3 dup ACKs,
           |      1 MSS on timeout
           v
@@ -1083,17 +1088,17 @@ ask where a number comes from; this is the answer.
      no ACK:      timeout (RTO = EstimatedRTT + 4*DevRTT, doubled), go back, slow start
 
   receiving (HTTP request): TcpReceiver.on_segment
-     in order -> ready buffer -> read() by the application -> window grows -> window update
+     in order -> buffered data -> read() by the application -> window grows -> window update
      gap      -> out_of_order store + duplicate ACK; filled -> ACK at once
-     window() = RcvBuffer - unread bytes, sent in every segment we send
+     rwnd() = RcvBuffer - buffered data, sent in every segment we send
 ```
 
 What to remember for each feature:
 
 - **Reliable transfer:** cumulative ACKs, one timer for the oldest unACKed byte, timeout and fast
   retransmit, RTT-based timeout, receiver ordering with the four slide 3-85 rules.
-- **Flow control:** window = RcvBuffer − unread bytes; the sender keeps in flight ≤ rwnd; a zero
-  window is broken by our update (F4) or the sender's probe (F3).
+- **Flow control:** rwnd = RcvBuffer − buffered data (4096 by default); the sender keeps in flight
+  ≤ rwnd; a zero window is broken by our update (F4) or the sender's probe every 0.5 s.
 - **Congestion control:** cwnd from slow start (+1 MSS per ACK), congestion avoidance (+MSS·MSS/cwnd),
   fast recovery (ssthresh + 3 MSS), timeout (1 MSS); ssthresh = half of cwnd at a loss.
 - **Where they meet:** `TcpSender._send_allowed`, `min(cwnd, rwnd) − in flight`.
@@ -1110,7 +1115,7 @@ plumbing everyone should recognise.
 - `write` (reliable): takes the next block of application data and sends what the window allows.
 - `close` (reliable): asks for a FIN after the last data byte.
 - `on_ack` (reliable, flow): handles one ACK number and window; new, duplicate, old or impossible.
-- `on_tick` (reliable, flow): runs the retransmission timer and the persist timer.
+- `on_tick` (reliable, flow): runs the retransmission timer and the probe timer.
 - `bytes_in_flight` (all): `snd_nxt − snd_una`.
 - `data_end` (reliable): the sequence number just after the last data byte.
 - `data_acked` (reliable): True when every data byte is ACKed.
@@ -1128,21 +1133,22 @@ plumbing everyone should recognise.
 - `_on_new_ack` (reliable, congestion): a new cumulative ACK (slides 3-84, 3-87).
 - `_on_duplicate_ack` (reliable, congestion): counts it and may fast retransmit (slide 3-88).
 - `_fast_retransmit` (reliable, congestion): resends the segment at `snd_una` (slide 3-88).
-- `_update_rwnd` (flow): takes the client's window; `RWND_ZERO` / `RWND_OPEN`.
-- `_probe_needed` (flow): rwnd 0, nothing in flight, data waiting.
-- `_check_persist` (flow): arms or disarms the persist timer.
-- `_send_window_probe` (flow): one byte at `snd_nxt` to ask for the window.
+- `update_rwnd` (flow): takes the client's window; `RWND_ZERO` / `RWND_OPEN` (slide 3-94).
+- `check_probe_timer` (flow): arms the probe timer while rwnd is 0, nothing is in flight and data
+  waits; stops it otherwise.
+- `send_probe` (flow): one byte at `snd_nxt` every 0.5 s to ask for the window.
 
 ### `tcp_receiver.py` (class `TcpReceiver`)
 
-- `on_segment` (reliable, flow): picks the slide 3-85 rule and trims to the window.
+- `on_segment` (reliable, flow): picks the slide 3-85 rule; `trim_to_window` cuts it to the window.
+- `trim_to_window` (flow): cuts bytes we already have and bytes past the right edge (slide 3-94).
 - `_deliver_in_order` (reliable): appends in-order bytes and moves `rcv_nxt` (slide 3-80).
 - `_store_out_of_order` (reliable): keeps a segment above the gap.
 - `_pull_from_out_of_order` (reliable): moves stored segments in once the gap is filled.
 - `on_tick` (reliable): the delayed-ACK timer.
-- `read` (flow): hands bytes to the application, which opens the window.
-- `readable` (shared): bytes ready or FIN received.
-- `window` (flow): `RcvBuffer − (LastByteRcvd − LastByteRead)` (slide 3-94).
+- `read` (flow): hands bytes to the application, which frees buffer space (slide 3-90).
+- `readable` (shared): bytes buffered or FIN received.
+- `rwnd` (flow): `RcvBuffer − buffered data` (slide 3-94).
 - `window_update_due` (flow): rule F4.
 - `ack_sent` (reliable, flow): a segment with `ack = rcv_nxt` went out; remember its window.
 - `next_deadline` (shared): the delayed-ACK deadline.

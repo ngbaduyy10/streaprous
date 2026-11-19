@@ -19,6 +19,8 @@ from collections import namedtuple
 # 'retransmit' (resent after going back), 'timeout', 'fast', 'probe' or 'fin'.
 SendSegment = namedtuple('SendSegment', ['seq', 'payload', 'fin', 'kind'])
 
+PROBE_INTERVAL = 0.5                 # extra: one data byte every 0.5 s while rwnd is 0
+
 
 class TcpSender:
     """
@@ -36,13 +38,10 @@ class TcpSender:
         rtt: RttEstimator that gives the timeout (slides 3-82 to 3-84).
         cc: RenoCongestion that gives cwnd (slide 3-125).
         max_retries: Timeouts in a row before we give up.
-        persist_min: First zero-window probe interval in seconds.
-        persist_max: Largest zero-window probe interval in seconds.
         on_event: Callback ``on_event(name, **details)`` for trace events.
     """
 
-    def __init__(self, iss, mss, rwnd, rtt, cc, max_retries, persist_min, persist_max,
-                 on_event=None):
+    def __init__(self, iss, mss, rwnd, rtt, cc, max_retries, on_event=None):
         """
         Start with nothing to send, no timer and no probe.
 
@@ -53,16 +52,12 @@ class TcpSender:
             rtt: RttEstimator that gives the timeout.
             cc: RenoCongestion that gives cwnd.
             max_retries: Timeouts in a row before we give up.
-            persist_min: First zero-window probe interval in seconds.
-            persist_max: Largest zero-window probe interval in seconds.
             on_event: Callback ``on_event(name, **details)``; None means no events.
         """
         self.mss = mss
         self.rtt = rtt
         self.cc = cc
         self.max_retries = max_retries
-        self.persist_min = persist_min
-        self.persist_max = persist_max
         self.on_event = on_event or (lambda name, **details: None)
 
         self.snd_una = iss
@@ -78,8 +73,7 @@ class TcpSender:
         self.timeouts_in_row = 0
         self.timed_end = None
         self.timed_at = None
-        self.persist_deadline = None
-        self.persist_interval = persist_min
+        self.probe_deadline = None
         self.probe_seq = None
         self.gave_up = False
 
@@ -164,14 +158,14 @@ class TcpSender:
         # An ACK that only opens rwnd is flow control, not a loss (book 3.5.5).
         duplicate = (self.snd_nxt > self.snd_una and not has_data
                      and window == self.rwnd)
-        self._update_rwnd(window)
+        self.update_rwnd(window)
         if duplicate:
             return self._on_duplicate_ack(now)
         return self._send_allowed(now)
 
     def on_tick(self, now):
         """
-        Run the retransmission timer and the persist timer.
+        Run the retransmission timer and the probe timer.
 
         Args:
             now: Current time in seconds.
@@ -184,8 +178,8 @@ class TcpSender:
         out = []
         if self.timer_deadline is not None and now >= self.timer_deadline:
             out.extend(self._on_timeout(now))
-        if self.persist_deadline is not None and now >= self.persist_deadline:
-            out.extend(self._send_window_probe(now))
+        if self.probe_deadline is not None and now >= self.probe_deadline:
+            out.extend(self.send_probe(now))
         return out
 
     def bytes_in_flight(self):
@@ -229,10 +223,10 @@ class TcpSender:
         Give the time the caller must call ``on_tick`` next.
 
         Returns:
-            float or None: The earlier of the retransmission and persist
+            float or None: The earlier of the retransmission and probe
             deadlines, or None when neither timer runs.
         """
-        deadlines = [d for d in (self.timer_deadline, self.persist_deadline)
+        deadlines = [d for d in (self.timer_deadline, self.probe_deadline)
                      if d is not None]
         return min(deadlines) if deadlines else None
 
@@ -259,12 +253,11 @@ class TcpSender:
         Transmit new segment(s), as allowed (slide 3-122).
 
         Sends from ``snd_nxt`` while the usable window lets a segment out.
-        A segment shorter than one MSS waits while data is in flight,
-        unless it is the last piece of data: ACKs will open room for a
-        full one. With nothing in flight a small segment goes out, so a
-        window below one MSS cannot stall us. Bytes below ``snd_max`` are
-        resent after a timeout ('retransmit'). After the data, the FIN goes
-        out without needing window space.
+        Each segment is at most one MSS and at most the usable window, so
+        the window is filled exactly and a segment may be shorter than one
+        MSS (slide 3-122 counts bytes). Bytes below ``snd_max`` are resent
+        after a timeout ('retransmit'). After the data, the FIN goes out
+        without needing window space.
 
         Args:
             now: Current time in seconds.
@@ -278,8 +271,6 @@ class TcpSender:
                 remaining = self.data_end() - self.snd_nxt
                 length = min(self.mss, remaining, self._usable_window())
                 if length <= 0:
-                    break
-                if length < self.mss and length < remaining and self.bytes_in_flight() > 0:
                     break
                 seq = self.snd_nxt
                 resend = seq < self.snd_max
@@ -306,7 +297,7 @@ class TcpSender:
                         self._start_timer(now)
                     self.on_event('FIN_SENT', seq=seq)
                 break
-        self._check_persist(now)
+        self.check_probe_timer(now)
         return out
 
     def _payload(self, seq, length):
@@ -431,7 +422,7 @@ class TcpSender:
         if self.timeouts_in_row > self.max_retries:
             self.gave_up = True
             self._stop_timer()
-            self.persist_deadline = None
+            self.probe_deadline = None
             self.on_event('GIVE_UP', reason='timeouts')
             return []
         self.timeouts += 1
@@ -473,7 +464,7 @@ class TcpSender:
         self.snd_nxt = max(self.snd_nxt, ack)
         self.snd_max = max(self.snd_max, self.snd_nxt)  # an ACKed probe byte
         self.probe_seq = None
-        self._update_rwnd(window)
+        self.update_rwnd(window)
         self._take_rtt_sample(ack, now)
         self.timeouts_in_row = 0
         self.cc.on_new_ack()
@@ -535,12 +526,9 @@ class TcpSender:
     # Flow control
     # ------------------------------------------------------------------
 
-    def _update_rwnd(self, window):
+    def update_rwnd(self, window):
         """
-        Take the receiver's advertised window (slide 3-94).
-
-        When the window opens after being 0, probing stops and the probe
-        interval starts again from ``persist_min``.
+        Set rwnd to the received rwnd (slide 3-94).
 
         Args:
             window: Window field of the received segment in bytes.
@@ -550,59 +538,44 @@ class TcpSender:
         if old > 0 and window == 0:
             self.on_event('RWND_ZERO', ack=self.snd_una)
         elif old == 0 and window > 0:
-            self.persist_interval = self.persist_min
-            self.persist_deadline = None
             self.on_event('RWND_OPEN', rwnd=window)
 
-    def _probe_needed(self):
+    def check_probe_timer(self, now):
         """
-        Tell whether the zero-window probe timer should run.
+        Arm or stop the probe timer.
 
-        Returns:
-            bool: True when rwnd is 0, nothing is in flight and data waits.
-        """
-        return (self.rwnd == 0 and self.bytes_in_flight() == 0
-                and self.snd_nxt < self.data_end())
-
-    def _check_persist(self, now):
-        """
-        Arm or disarm the persist timer for zero-window probes.
-
-        With rwnd 0 and nothing in flight no ACK will come to tell us the
-        window opened, so a timer must ask. An armed timer keeps its deadline.
+        extra: a probe is needed while rwnd is 0, nothing is in flight and
+        data waits. Then no ACK will come to tell us the window opened.
 
         Args:
             now: Current time in seconds.
         """
-        if not self._probe_needed():
-            self.persist_deadline = None
-        elif self.persist_deadline is None:
-            self.persist_deadline = now + self.persist_interval
+        needed = (self.rwnd == 0 and self.bytes_in_flight() == 0
+                  and self.snd_nxt < self.data_end())
+        if not needed:
+            self.probe_deadline = None
+        elif self.probe_deadline is None:
+            self.probe_deadline = now + PROBE_INTERVAL
 
-    def _send_window_probe(self, now):
+    def send_probe(self, now):
         """
         Send one byte at ``snd_nxt`` to ask for the window (slide 3-94).
 
-        The receiver answers with an ACK that carries its current window, so
-        a lost window update cannot stall us. The probe byte is not counted
-        in flight. The interval doubles up to ``persist_max`` (the persist
-        timer is background, not on the slides).
+        extra: with rwnd 0, one data byte every 0.5 s. If the receiver's
+        window update is lost, its answer to a probe still brings the new
+        rwnd. The probe byte is neither timed nor counted in flight.
 
         Args:
             now: Current time in seconds.
 
         Returns:
-            list: The probe segment, or [] when no probe is needed any more.
+            list: The probe segment, or [] when no probe is needed.
         """
-        if not self._probe_needed():
-            self.persist_deadline = None
+        self.probe_deadline = None
+        self.check_probe_timer(now)    # re-arms the next probe; None means none is needed
+        if self.probe_deadline is None:
             return []
-        seq = self.snd_nxt
-        interval = self.persist_interval
+        self.probe_seq = self.snd_nxt
         self.probes += 1
-        segment = self._emit(seq, self._payload(seq, 1), False, 'probe', False)
-        self.probe_seq = seq
-        self.on_event('PROBE', seq=seq, interval=interval)
-        self.persist_interval = min(2 * self.persist_interval, self.persist_max)
-        self.persist_deadline = now + self.persist_interval
-        return [segment]
+        self.on_event('PROBE', seq=self.probe_seq)
+        return [self._emit(self.snd_nxt, self._payload(self.snd_nxt, 1), False, 'probe', False)]
