@@ -250,6 +250,18 @@ class RenoNumbersTest(unittest.TestCase):
                  (SLOW_START, CONGESTION_AVOIDANCE)]
         self.assertEqual(events, [('STATE', {'old': old, 'new': new}) for old, new in pairs])
 
+    def test_book_figure_3_52_triple_duplicate_ack(self):
+        """Book figure 3.52: 12 MSS at the third duplicate ACK gives ssthresh 6 MSS, cwnd 9 MSS."""
+        cc = RenoCongestion(1000, 6000)
+        cc.cwnd = 12000
+        cc.state = CONGESTION_AVOIDANCE
+        cc.on_duplicate_ack()
+        cc.on_duplicate_ack()
+        self.assertTrue(cc.on_duplicate_ack())
+        self.assertEqual(cc.ssthresh, 6000)   # 0.5 * 12 MSS
+        self.assertEqual(cc.cwnd, 9000)       # ssthresh + 3 MSS, as in the figure
+        self.assertEqual(cc.state, FAST_RECOVERY)
+
     def test_slide_rules(self):
         """Each Reno function's docstring carries its slide rule."""
         assert_slide_rules(self, 'tcp_reno', RENO_RULES)

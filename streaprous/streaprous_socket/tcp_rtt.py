@@ -3,6 +3,12 @@ StreapRous TCP round trip time
 Keeps EstimatedRTT, DevRTT and TimeoutInterval for the sender's timer (slides 3-81 to 3-83).
 """
 
+# WHY an estimator: the book (3.5.3) and slide 3-81 say the timeout must be longer
+# than the RTT, but not too much longer. Too short gives needless retransmissions,
+# too long makes loss recovery slow. Because RTT varies from segment to segment, the
+# timeout follows a running average of measured RTTs plus a safety margin from their
+# variation.
+
 ALPHA = 0.125                      # slide 3-82
 BETA = 0.25                        # slide 3-83
 FIRST_TIMEOUT_INTERVAL = 1.0       # extra: before the first SampleRTT
@@ -59,6 +65,8 @@ class RttEstimator:
         """Moves EstimatedRTT towards the new sample (slide 3-82).
 
         EstimatedRTT = (1 - alpha)*EstimatedRTT + alpha*SampleRTT, alpha = 0.125.
+        An exponentially weighted moving average: the influence of a past sample
+        decreases exponentially fast, so old samples fade out.
 
         Args:
              sample_rtt  measured round trip time in seconds
@@ -83,6 +91,8 @@ class RttEstimator:
         """Sets the timer's interval from the two averages (slide 3-83).
 
         TimeoutInterval = EstimatedRTT + 4*DevRTT: the estimate plus a safety margin.
+        WHY 4*DevRTT: a large margin when the RTT is jumpy, a small one when it is
+        stable (3-83: "large variation in EstimatedRTT: want a larger safety margin").
 
         extra: never below 0.2 s. Linux clients delay an ACK at most 200 ms and our
         receiver 100 ms (Linux, background), and that delay already feeds SampleRTT,

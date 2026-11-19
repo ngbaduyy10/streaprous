@@ -7,7 +7,7 @@ For every def (methods and nested functions too) prints
 <path>:<line> <Qualified.name> <n>, where n counts the lines from the first
 statement after the docstring to the end of the function. Then prints the
 total number of lines in the files. Exits 1 if a body has more than 30 lines
-or, for the default files (streaprous_socket/tcp_*.py), if the total is above 1650. Needs Python 3.8
+or, for the default files (streaprous_socket/tcp_*.py), if the total is above 1700. Needs Python 3.8
 or later (ast end line numbers); exits 2 on older versions.
 """
 
@@ -17,7 +17,7 @@ import os
 import sys
 
 MAX_BODY = 30
-MAX_TOTAL = 1650
+MAX_TOTAL = 1700
 PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

@@ -242,6 +242,9 @@ A: The timer (`on_timeout` → `resend_oldest`, 3-84) or three duplicate ACKs (`
 Q: What exactly does a timeout resend?\
 A: The oldest unACKed segment exactly as first sent: `segment_end` maps each unACKed segment's first seq # to the seq # after its last byte. In the 3-86 premature-timeout case that is Seq=92 with 8 bytes, as the slide draws it; after a partial ACK only the rest of that segment (`test_resend_never_past_next_seq_num`, `test_resend_after_small_window`).
 
+Q: Does TimeoutInterval double after a timeout?\
+A: No. 3-84 says only "retransmit segment that caused timeout; restart timer", so `on_timeout` restarts the timer with the same TimeoutInterval (`test_timeout_keeps_timeout_interval`, `test_dead_link_resends_at_fixed_interval`). Doubling it is the textbook's rule (background), not the slides'. After a timeout cwnd is 1 MSS, so we resend one segment per TimeoutInterval, and a vanished client is caught by the 10 s silence rule.
+
 Q: The ACK is lost, not the data (3-86 left). What happens?\
 A: Our timer resends Seq=92; the receiver's `is_old_segment` sees every byte is below `expected_seq_num`, logs DUP_SEGMENT and ACKs 100 again (`test_lost_ack_scenario`).
 

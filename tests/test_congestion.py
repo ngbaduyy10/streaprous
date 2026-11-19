@@ -41,3 +41,15 @@ def test_window_is_clamped():
     assert cc.window == 12
     with pytest.raises(ValueError):
         make_controller("bbr", 10, 100)
+
+
+@pytest.mark.parametrize("name", ["reno", "cubic"])
+def test_defaults_follow_slides(name):
+    cc = make_controller(name, initial=1, maximum=100)
+    assert cc.cwnd == 1            # slide 3-123: initially cwnd = 1 MSS
+    cc.on_ack(7, 0.01, 0.0)        # slow start: +1 per ACK
+    assert cc.cwnd == 8
+    cc.on_timeout(1.0)
+    assert cc.cwnd == 1            # slide 3-125: timeout gives cwnd = 1 MSS
+
+

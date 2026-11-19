@@ -26,6 +26,9 @@ from .tcp_segment import ACK, FIN, RST, SYN, parse_mss_option, parse_tcp_packet,
 from .tcp_sender import TcpSender
 from .tcp_trace import TcpTrace
 
+# MSS 1460 = 1500 bytes Ethernet MTU - 20 IP header - 20 TCP header. The book
+# (3.5.1) gives 1460 as a typical MSS. 536 is the minimum a host must accept
+# when the peer does not say.
 MAX_MSS = 1460          # extra: largest MSS we use, the client's option at most
 DEFAULT_MSS = 536       # extra: MSS when the client's SYN had no MSS option
 PEER_SILENCE = 10.0     # extra: give up after 10 s without any segment while data waits
@@ -92,6 +95,7 @@ class TcpConnection:
             csv_path = None
         self.trace = TcpTrace(self.name, csv_path, clock=clock)
         self.rtt = RttEstimator()
+        # One Reno per connection, so one loss does not slow down another (book 3.7.3).
         self.reno = RenoCongestion(self.mss, log=self.log)
         self.sender = TcpSender(conn_info.server_seq, self.mss, rwnd, self.reno, self.rtt,
                                 self.log)

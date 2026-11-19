@@ -69,6 +69,8 @@ def load_settings(environ):
     except ValueError as err:
         raise ValueError("STREAPROUS_DROP_SEND: %s" % err)
     return types.SimpleNamespace(
+        # RcvBuffer for flow control (slide 3-94, book 3.5.5). Upper limit 65535
+        # because the receive window field in the TCP header is 16 bits (book 3.5.2).
         rcv_buffer=read_number(environ, 'STREAPROUS_RCVBUF', 4096, 1, 65535),
         drop_send=drop_send,
         loss_rate=read_number(environ, 'STREAPROUS_LOSS', 0.0, 0.0, 1.0),

@@ -21,6 +21,6 @@ class TransportConfig:
     bind_probe_interval: float = 0.25
     tick_interval: float = 0.02
     congestion: str = "cubic"
-    initial_cwnd: int = 10
+    initial_cwnd: int = 1
     max_cwnd: int = 2048
     socket_buffer: int = 4 * 1024 * 1024

@@ -36,6 +36,13 @@ class TcpReceiver:
         An empty segment elsewhere than ``expected_seq_num`` is a probe and gets
         an ACK. A FIN counts only on an in-order segment not cut at the window edge.
 
+        ACK generation follows the table of slide 3-85 (book 3.5.4): in-order
+        segment, nothing pending -> wait (delayed ACK); in-order segment, ACK pending
+        -> send one cumulative ACK now; segment above the expected number (a gap) ->
+        send a duplicate ACK at once; segment that fills a gap -> ACK at once. The
+        duplicate ACKs are exactly what the sender's fast retransmit (3-88) and Reno
+        (3-125) depend on.
+
         Args:
              seq   seq # of the first data byte, already unwrapped
              data  the payload bytes (may be empty)
@@ -117,6 +124,8 @@ class TcpReceiver:
 
         Slide 3-85: "immediately send duplicate ACK, indicating seq. # of next expected
         byte". Keeping it is "up to implementor" (slide 3-79): we keep the longer copy.
+        WHY keep it: real implementations buffer such segments (book 3.5.4), so only
+        the missing segment needs to be resent, not everything after it as in Go-Back-N.
 
         Args:
              seq   seq # of the first byte, above ``expected_seq_num``
@@ -218,6 +227,8 @@ class TcpReceiver:
 
         Slide 3-94: the receiver "advertises" free buffer space in rwnd field.
         Out-of-order bytes lie inside the window already advertised, so they do not count.
+        Book 3.5.5 writes it rwnd = RcvBuffer - [LastByteRcvd - LastByteRead]: the bytes
+        the application has not read yet (buffered_data) take up space.
         """
         return self.rcv_buffer - len(self.buffered_data)
 

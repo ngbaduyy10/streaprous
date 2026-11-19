@@ -123,6 +123,7 @@ class TcpSender:
             self.on_new_ack(ack, now)
             self.update_rwnd(window)
             return self.send_allowed(now)
+        # An ACK that only changes rwnd is flow control, not a loss (book 3.5.5).
         duplicate = self.in_flight() > 0 and not carries_data and window == self.rwnd
         self.update_rwnd(window)
         if duplicate:
@@ -191,6 +192,7 @@ class TcpSender:
         """
         segments = []
         while self.next_seq_num < self.data_end():
+            # cwnd is the network, rwnd the receiver. Zero or less means wait (book 3.7.1).
             room = min(self.reno.cwnd, self.rwnd) - self.in_flight()
             length = min(self.mss, self.data_end() - self.next_seq_num, room)
             if length <= 0:
@@ -282,6 +284,7 @@ class TcpSender:
         Returns:
              list of SendSegment to put on the wire
         """
+        # True only on the third duplicate ACK: that is the fast retransmit (book 3.5.4).
         third = self.reno.on_duplicate_ack()
         self.log('DUPACK', ack=self.send_base, count=self.reno.dup_ack_count)
         segments = []
@@ -318,6 +321,7 @@ class TcpSender:
         if self.in_flight() == 0:
             self.stop_timer()
             return []
+        # on_timeout drops cwnd to 1 MSS (slide 3-125). No doubling: 3-84 only restarts the timer.
         self.reno.on_timeout()
         segment = self.resend_oldest('timeout')
         self.start_timer(now)
@@ -339,6 +343,7 @@ class TcpSender:
         Returns:
              the SendSegment starting at SendBase
         """
+        # Karn's rule (book 3.5.3): an ACK can't tell the original from the copy.
         self.rtt_timed_seq = None
         if self.fin_seq is not None and self.send_base == self.fin_seq:
             return SendSegment(self.send_base, b"", True, kind)
