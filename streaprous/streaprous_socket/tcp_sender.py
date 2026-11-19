@@ -159,20 +159,9 @@ class TcpSender:
         if ack < self.snd_una or ack > limit:
             return []
         if ack > self.snd_una:
-            # > means "greater than": a higher ACK number, new bytes are
-            # acknowledged. self._on_new_ack(...) runs that function. return
-            # passes on the result of _send_allowed and ends on_ack.
             self._on_new_ack(ack, window, now)
             return self._send_allowed(now)
-        # Book 3.5.4: a duplicate ACK repeats an ACK number we already had.
-        # The extra conditions (data outstanding, no payload, same window)
-        # are from RFC 5681. WHY: an ACK that only changes rwnd is flow
-        # control (book 3.5.5), not a sign of loss, so Reno must not count it.
-        # The parentheses are one true/false expression, stored in duplicate.
-        # and requires every part to be true. not flips has_data. == tests equality.
-        # A dupACK only when data is outstanding, the segment has no data, and
-        # the window is unchanged. An ACK that only opens rwnd is flow control,
-        # not a sign of loss, and must not make Reno think the network is dropping.
+        # An ACK that only opens rwnd is flow control, not a loss (book 3.5.5).
         duplicate = (self.snd_nxt > self.snd_una and not has_data
                      and window == self.rwnd)
         self._update_rwnd(window)
@@ -262,13 +251,7 @@ class TcpSender:
             int: ``min(cwnd, rwnd) - bytes_in_flight()``; may be negative
             when a window shrank.
         """
-        # Book 3.7.1: LastByteSent - LastByteAcked <= min(cwnd, rwnd).
-        # cwnd limits what the network can carry, rwnd (book 3.5.5) what the
-        # receiver can store. Zero or negative means: wait for ACKs.
-        # min(...) takes the smaller of the two numbers. self.bytes_in_flight()
-        # runs the method and returns a number, then - subtracts it.
-        # cwnd protects the network, rwnd protects the receiver. Zero or
-        # negative means: wait. bytes_in_flight is snd_nxt - snd_una.
+        # cwnd is the network, rwnd the receiver. Zero or less means wait (book 3.7.1).
         return min(self.cc.cwnd, self.rwnd) - self.bytes_in_flight()
 
     def _send_allowed(self, now):
@@ -293,26 +276,15 @@ class TcpSender:
         while True:
             if self.snd_nxt < self.data_end():
                 remaining = self.data_end() - self.snd_nxt
-                # min of three numbers: at most 1 MSS, no more than the data left,
-                # and no more than min(cwnd, rwnd) minus what is already out.
-                # _usable_window() is called and the number it returns is used at once.
                 length = min(self.mss, remaining, self._usable_window())
-                # <= means "less than or equal". break leaves the while loop:
-                # no more segments fit right now.
                 if length <= 0:
                     break
                 if length < self.mss and length < remaining and self.bytes_in_flight() > 0:
                     break
                 seq = self.snd_nxt
-                # < becomes True or False and is stored in resend. True when this
-                # sequence number was already sent once (seq below snd_max).
                 resend = seq < self.snd_max
-                # Karn's rule (book 3.5.3): SampleRTT is never measured for a
-                # retransmitted segment, because an ACK cannot tell whether it
-                # answers the original or the copy.
                 if resend:
-                    # Karn's rule: do not measure RTT on a segment that is sent again.
-                    # The ACK might answer the original or the copy.
+                    # Karn's rule (book 3.5.3): an ACK can't tell the original from the copy.
                     self._cancel_rtt_timing()
                 elif self.timed_end is None:
                     self.timed_end = seq + length
@@ -397,10 +369,6 @@ class TcpSender:
         Args:
             now: Current time in seconds.
         """
-        # Book 3.5.4: TCP uses ONE retransmission timer, tied to the oldest
-        # unACKed segment. WHY one: simpler than a timer per segment, and
-        # the oldest segment is the first one that must be repeated.
-        # The length is TimeoutInterval from the RTT estimator (book 3.5.3).
         self.timer_deadline = now + self.rtt.rto
 
     def _stop_timer(self):
@@ -460,9 +428,6 @@ class TcpSender:
             self._stop_timer()
             return []
         self.timeouts_in_row += 1
-        # Not in the book: a practical limit so a dead peer does not keep the
-        # connection open forever. After max_retries timeouts in a row we
-        # give up and report it.
         if self.timeouts_in_row > self.max_retries:
             self.gave_up = True
             self._stop_timer()
@@ -470,27 +435,11 @@ class TcpSender:
             self.on_event('GIVE_UP', reason='timeouts')
             return []
         self.timeouts += 1
-        # Book 3.5.4: on a timeout TCP resends the oldest unACKed segment and
-        # doubles TimeoutInterval. The book calls this a limited form of
-        # congestion control: a timeout is most likely caused by congestion,
-        # so we wait longer before trying again instead of adding load.
-        # In addition Reno cuts cwnd to 1 MSS (book 3.7.1, slide 3-124).
-        # self.rtt.back_off() and self.cc.on_timeout() are called, and the
-        # return value is unused: on_timeout returns None, its job is to
-        # change cwnd. Two reactions to the same timeout. back_off doubles
-        # the RTO, so we wait longer next time. on_timeout sets cwnd to 1 MSS
-        # and halves ssthresh.
+        # back_off doubles the wait. on_timeout drops cwnd to 1 MSS (slide 3-124).
         self.rtt.back_off()
         self.cc.on_timeout()
-        # Karn's rule: the new copy must not be used for an RTT measurement.
+        # Karn's rule (book 3.5.3): don't time the retransmitted copy.
         self._cancel_rtt_timing()
-        # Not in the book: BSD Reno behaviour. Go back to the oldest unACKed
-        # byte and send the rest of the window again as ACKs open it. ACKs
-        # are cumulative (book 3.5.4), so one ACK covers bytes the receiver
-        # already had and the extra copies cost little.
-        # = copies the number: snd_nxt is set equal to snd_una, the oldest
-        # unacknowledged byte. The rest of the window is sent again as ACKs
-        # open room, so several losses in one window cost one timeout.
         self.snd_nxt = self.snd_una
         payload, fin = self._segment_at_una()
         seq = self.snd_una
@@ -519,10 +468,6 @@ class TcpSender:
             window: Window field of the segment in bytes.
             now: Current time in seconds.
         """
-        # Book 3.5.4: ACKs are cumulative, an ACK number means every byte
-        # below it arrived. So one ACK can acknowledge many segments, and a
-        # lost ACK is covered by the next one. The timer restarts while data
-        # is still outstanding and stops when everything is ACKed.
         acked = ack - self.snd_una
         self.snd_una = ack
         self.snd_nxt = max(self.snd_nxt, ack)
@@ -531,12 +476,6 @@ class TcpSender:
         self._update_rwnd(window)
         self._take_rtt_sample(ack, now)
         self.timeouts_in_row = 0
-        # The sender does not decide the window itself: it tells Reno that an
-        # ACK arrived, and Reno updates cwnd (book 3.7.1). _send_allowed()
-        # then uses the new room. This is the self-clocking of TCP.
-        # self.cc.on_new_ack() calls Reno. It returns None; it changes cwnd
-        # (slow start, avoidance, or out of fast recovery). _send_allowed
-        # afterwards uses the new room.
         self.cc.on_new_ack()
         if self.snd_una < self.snd_nxt:
             self._start_timer(now)
@@ -558,19 +497,12 @@ class TcpSender:
         Returns:
             list: SendSegment values to transmit now.
         """
-        # Reno answers True only at the third duplicate ACK. That is the
-        # fast retransmit of book 3.5.4. Before that we only count, because
-        # one or two duplicate ACKs may be reordering.
-        # on_duplicate_ack() returns True or False. True only on the third
-        # dupACK: then the lost segment must be sent at once.
+        # True only on the third duplicate ACK: that is the fast retransmit (book 3.5.4).
         retransmit_now = self.cc.on_duplicate_ack()
         self.on_event('DUPACK', ack=self.snd_una, count=self.cc.dup_ack_count)
         out = []
-        # if runs only when retransmit_now is True. extend puts every
-        # segment from the inner list into out.
         if retransmit_now:
             out.extend(self._fast_retransmit(now))
-        # In fast recovery cwnd grows with each dupACK, so new data can go out afterwards.
         out.extend(self._send_allowed(now))
         return out
 
@@ -589,18 +521,10 @@ class TcpSender:
         Returns:
             list: The retransmitted segment.
         """
-        # Book 3.5.4: resend the missing segment before its timer expires.
-        # WHY only this one: later segments arrived (they caused the
-        # duplicate ACKs), so most likely just the one at snd_una is lost.
-        # snd_nxt stays, we do not go back like after a timeout.
-        # _segment_at_una() returns two values, unpacked into payload and fin.
-        # Fast retransmit (slide 3-88): resend the segment at snd_una without
-        # waiting for the timer. Three dupACKs mean later segments arrived,
-        # so most likely only this one is missing.
         payload, fin = self._segment_at_una()
         seq = self.snd_una
         self.fast_retransmits += 1
-        # Karn's rule: do not measure RTT on the copy.
+        # Karn's rule (book 3.5.3): don't time the copy.
         self._cancel_rtt_timing()
         segment = self._emit(seq, payload, fin, 'fast', True)
         self.snd_max = max(self.snd_max, seq + (1 if fin else len(payload)))
@@ -621,10 +545,6 @@ class TcpSender:
         Args:
             window: Window field of the received segment in bytes.
         """
-        # Book 3.5.5: the receiver advertises rwnd = RcvBuffer -
-        # (LastByteRcvd - LastByteRead) in every segment, and the sender
-        # keeps LastByteSent - LastByteAcked <= rwnd. This is flow control:
-        # it stops the sender from overflowing the receiver's buffer.
         old = self.rwnd
         self.rwnd = window
         if old > 0 and window == 0:
@@ -674,12 +594,6 @@ class TcpSender:
         Returns:
             list: The probe segment, or [] when no probe is needed any more.
         """
-        # Book 3.5.5: if rwnd = 0 the receiver has nothing to send, so it
-        # would never tell us that the window opened and we would be blocked
-        # forever. The fix in the book: keep sending segments with one data
-        # byte, so the receiver's ACKs carry the current rwnd. The growing
-        # probe interval (persist_min to persist_max) is an implementation
-        # choice, not from the book.
         if not self._probe_needed():
             self.persist_deadline = None
             return []
